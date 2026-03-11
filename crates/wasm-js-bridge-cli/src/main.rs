@@ -1,18 +1,19 @@
 //! wasm-js-bridge CLI — build Rust crates into npm WASM packages.
 //!
 //! Compiles to WASM via cargo, then uses wasm-bindgen-cli-support in-memory
-//! API to emit exactly the files we want, where we want them:
+//! API to emit fully self-contained JS files with the WASM binary inlined:
 //!
 //! ```text
 //! {out_dir}/
-//!   {stem}.js          ESM (bundler target)
-//!   {stem}.cjs         CJS (nodejs target — `.cjs` extension, not a package.json trick)
-//!   {stem}_bg.wasm     shared WASM binary
-//!   {stem}.d.ts        TypeScript declarations (via ts-rs codegen test)
-//!   {stem}.js.flow     Flow declarations (via flowjs-rs codegen test)
+//!   {stem}.js      ESM — WASM inlined as base64, no external .wasm file
+//!   {stem}.cjs     CJS — WASM inlined as base64, no external .wasm file
+//!   {stem}.d.ts    TypeScript declarations (via ts-rs codegen test)
+//!   {stem}.js.flow Flow declarations (via flowjs-rs codegen test)
 //! ```
 //!
 //! Source filename → output stem: `foo_bar.rs` → `fooBar`, `mod.rs` → parent dir name.
+
+mod inline;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -231,44 +232,12 @@ fn cargo_build_wasm(
     }
 }
 
-/// Generate ESM output using the wasm-bindgen in-memory API and write files
-/// directly to `out_dir`. Emits `{stem}.js` and `{stem}_bg.wasm`.
-fn generate_esm(wasm_path: &Path, out_dir: &Path, stem: &str) -> Result<(), String> {
-    std::fs::create_dir_all(out_dir)
-        .map_err(|e| format!("Failed to create {}: {e}", out_dir.display()))?;
-
-    let mut output = Bindgen::new()
-        .input_path(wasm_path)
-        .bundler(true)
-        .map_err(|e| format!("wasm-bindgen bundler setup failed: {e}"))?
-        .out_name(stem)
-        .generate_output()
-        .map_err(|e| format!("wasm-bindgen ESM generation failed: {e}"))?;
-
-    std::fs::write(out_dir.join(format!("{stem}.js")), output.js())
-        .map_err(|e| format!("Failed to write {stem}.js: {e}"))?;
-
-    std::fs::write(
-        out_dir.join(format!("{stem}_bg.wasm")),
-        output.wasm_mut().emit_wasm(),
-    )
-    .map_err(|e| format!("Failed to write {stem}_bg.wasm: {e}"))?;
-
-    Ok(())
-}
-
-/// Generate CJS output using the wasm-bindgen in-memory API and write files
-/// directly to `out_dir`. Emits `{stem}.cjs` — a true CJS file by extension,
-/// not a `.js` file relying on a `package.json` `"type"` field.
+/// Generate a self-contained CJS file with the WASM binary inlined as base64.
 ///
-/// The WASM binary is not re-written here; `generate_esm` already placed it.
-/// If `--cjs` is requested without `--js`, we write the WASM here instead.
-fn generate_cjs(
-    wasm_path: &Path,
-    out_dir: &Path,
-    stem: &str,
-    write_wasm: bool,
-) -> Result<(), String> {
+/// Uses wasm-bindgen nodejs target in-memory, then patches the `readFileSync`
+/// WASM load with an inline `Buffer.from('BASE64', 'base64')` before writing.
+/// No `_bg.wasm` file is emitted.
+fn generate_cjs(wasm_path: &Path, out_dir: &Path, stem: &str) -> Result<(), String> {
     std::fs::create_dir_all(out_dir)
         .map_err(|e| format!("Failed to create {}: {e}", out_dir.display()))?;
 
@@ -280,18 +249,73 @@ fn generate_cjs(
         .generate_output()
         .map_err(|e| format!("wasm-bindgen CJS generation failed: {e}"))?;
 
-    std::fs::write(out_dir.join(format!("{stem}.cjs")), output.js())
-        .map_err(|e| format!("Failed to write {stem}.cjs: {e}"))?;
+    let wasm_bytes = output.wasm_mut().emit_wasm();
+    let js = inline::inline_wasm_cjs(output.js(), &wasm_bytes)?;
 
-    if write_wasm {
-        std::fs::write(
-            out_dir.join(format!("{stem}_bg.wasm")),
-            output.wasm_mut().emit_wasm(),
-        )
-        .map_err(|e| format!("Failed to write {stem}_bg.wasm: {e}"))?;
+    std::fs::write(out_dir.join(format!("{stem}.cjs")), js)
+        .map_err(|e| format!("Failed to write {stem}.cjs: {e}"))
+}
+
+/// Generate a self-contained ESM file with the WASM binary inlined as base64.
+///
+/// Uses wasm-bindgen nodejs target in-memory (synchronous init, easier to
+/// inline than the async bundler target), patches the WASM load with an inline
+/// `Uint8Array.from(atob('BASE64'), ...)`, then rewraps as ESM. No `_bg.wasm`
+/// file is emitted.
+fn generate_esm(wasm_path: &Path, out_dir: &Path, stem: &str) -> Result<(), String> {
+    std::fs::create_dir_all(out_dir)
+        .map_err(|e| format!("Failed to create {}: {e}", out_dir.display()))?;
+
+    let mut output = Bindgen::new()
+        .input_path(wasm_path)
+        .nodejs(true)
+        .map_err(|e| format!("wasm-bindgen nodejs setup failed: {e}"))?
+        .out_name(stem)
+        .generate_output()
+        .map_err(|e| format!("wasm-bindgen ESM generation failed: {e}"))?;
+
+    let wasm_bytes = output.wasm_mut().emit_wasm();
+    let js = inline::inline_wasm_esm(output.js(), &wasm_bytes)?;
+
+    // wasm-bindgen nodejs output uses require/module.exports; convert to ESM.
+    let esm = cjs_to_esm(&js, stem);
+
+    std::fs::write(out_dir.join(format!("{stem}.js")), esm)
+        .map_err(|e| format!("Failed to write {stem}.js: {e}"))
+}
+
+/// Wrap a patched CJS string as an ESM module.
+///
+/// wasm-bindgen nodejs output uses `require` for internal helpers and
+/// `module.exports` for public API. We replace those with ESM equivalents.
+/// The `require('fs')` and `require('path')` calls have already been removed
+/// by the inlining step; the only remaining `require` calls are for
+/// `require('node:buffer')` (Buffer shim) which we replace with an import.
+fn cjs_to_esm(cjs: &str, _stem: &str) -> String {
+    // Replace `const { TextDecoder, TextEncoder } = require(...)` style requires
+    // with ESM imports, and `module.exports = {...}` with named exports.
+    // This is a best-effort conversion; wasm-bindgen nodejs output is consistent
+    // enough that the patterns below cover it reliably.
+    let mut out = cjs.to_string();
+
+    // require('node:buffer') or require('buffer') → import at top
+    if out.contains("require('buffer')") || out.contains("require(\"buffer\")") || out.contains("require('node:buffer')") {
+        out = out
+            .replace("require('buffer')", "__wjb_buffer__")
+            .replace("require(\"buffer\")", "__wjb_buffer__")
+            .replace("require('node:buffer')", "__wjb_buffer__");
+        out = format!("import * as __wjb_buffer__ from 'node:buffer';\n{out}");
     }
 
-    Ok(())
+    // module.exports = { ... } → export { ... }
+    if let Some(start) = out.rfind("module.exports = {") {
+        let end = out[start..].find('}').map(|i| i + start + 1).unwrap_or(out.len());
+        let exports_block = out[start + "module.exports = ".len()..end].to_string();
+        // Extract names: { foo, bar } → export { foo, bar };
+        out.replace_range(start..end, &format!("export {exports_block}"));
+    }
+
+    out
 }
 
 fn run_cargo_test_codegen(crate_dir: &Path, pkg_name: &str) -> Result<(), String> {
@@ -362,24 +386,22 @@ fn main() {
         None
     };
 
-    // Step 2: ESM output — also writes the shared _bg.wasm
+    // Step 2: ESM output — WASM inlined, no _bg.wasm written
     if want_js {
-        eprintln!("  → {stem}.js (ESM)");
+        eprintln!("  → {stem}.js (ESM, WASM inlined)");
         generate_esm(wasm_path.as_ref().unwrap(), &out_dir, &stem).unwrap_or_else(|e| {
             eprintln!("{e}");
             std::process::exit(1);
         });
     }
 
-    // Step 3: CJS output — writes _bg.wasm only if ESM didn't already
+    // Step 3: CJS output — WASM inlined, no _bg.wasm written
     if want_cjs {
-        eprintln!("  → {stem}.cjs (CJS)");
-        generate_cjs(wasm_path.as_ref().unwrap(), &out_dir, &stem, !want_js).unwrap_or_else(
-            |e| {
-                eprintln!("{e}");
-                std::process::exit(1);
-            },
-        );
+        eprintln!("  → {stem}.cjs (CJS, WASM inlined)");
+        generate_cjs(wasm_path.as_ref().unwrap(), &out_dir, &stem).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1);
+        });
     }
 
     // Step 4: Type declarations (.d.ts + .js.flow via cargo test codegen)
