@@ -18,6 +18,9 @@ mod inline;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const EXT_ESM: &str = "js";
+const EXT_CJS: &str = "cjs";
+
 use clap::Parser;
 use wasm_bindgen_cli_support::Bindgen;
 
@@ -252,8 +255,8 @@ fn generate_cjs(wasm_path: &Path, out_dir: &Path, stem: &str) -> Result<(), Stri
     let wasm_bytes = output.wasm_mut().emit_wasm();
     let js = inline::inline_wasm_cjs(output.js(), &wasm_bytes)?;
 
-    std::fs::write(out_dir.join(format!("{stem}.cjs")), js)
-        .map_err(|e| format!("Failed to write {stem}.cjs: {e}"))
+    std::fs::write(out_dir.join(format!("{stem}.{EXT_CJS}")), js)
+        .map_err(|e| format!("Failed to write {stem}.{EXT_CJS}: {e}"))
 }
 
 /// Generate a self-contained ESM file with the WASM binary inlined as base64.
@@ -280,8 +283,8 @@ fn generate_esm(wasm_path: &Path, out_dir: &Path, stem: &str) -> Result<(), Stri
     // wasm-bindgen nodejs output uses require/module.exports; convert to ESM.
     let esm = cjs_to_esm(&js, stem);
 
-    std::fs::write(out_dir.join(format!("{stem}.js")), esm)
-        .map_err(|e| format!("Failed to write {stem}.js: {e}"))
+    std::fs::write(out_dir.join(format!("{stem}.{EXT_ESM}")), esm)
+        .map_err(|e| format!("Failed to write {stem}.{EXT_ESM}: {e}"))
 }
 
 /// Wrap a patched CJS string as an ESM module.
@@ -388,7 +391,7 @@ fn main() {
 
     // Step 2: ESM output — WASM inlined, no _bg.wasm written
     if want_js {
-        eprintln!("  → {stem}.js (ESM, WASM inlined)");
+        eprintln!("  → {stem}.{EXT_ESM} (ESM, WASM inlined)");
         generate_esm(wasm_path.as_ref().unwrap(), &out_dir, &stem).unwrap_or_else(|e| {
             eprintln!("{e}");
             std::process::exit(1);
@@ -397,7 +400,7 @@ fn main() {
 
     // Step 3: CJS output — WASM inlined, no _bg.wasm written
     if want_cjs {
-        eprintln!("  → {stem}.cjs (CJS, WASM inlined)");
+        eprintln!("  → {stem}.{EXT_CJS} (CJS, WASM inlined)");
         generate_cjs(wasm_path.as_ref().unwrap(), &out_dir, &stem).unwrap_or_else(|e| {
             eprintln!("{e}");
             std::process::exit(1);
