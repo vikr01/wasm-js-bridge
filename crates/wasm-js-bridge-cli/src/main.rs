@@ -20,6 +20,8 @@ use std::process::Command;
 
 const EXT_ESM: &str = "js";
 const EXT_CJS: &str = "cjs";
+const EXT_DTS: &str = "d.ts";
+const EXT_FLOW: &str = "js.flow";
 
 use clap::Parser;
 use wasm_bindgen_cli_support::Bindgen;
@@ -409,7 +411,7 @@ fn main() {
 
     // Step 4: Type declarations (.d.ts + .js.flow via cargo test codegen)
     if want_dts || want_flow {
-        eprintln!("  → {stem}.d.ts + {stem}.js.flow (codegen)");
+        eprintln!("  → {stem}.{EXT_DTS} + {stem}.{EXT_FLOW} (codegen)");
         run_cargo_test_codegen(&crate_dir, &pkg_name).unwrap_or_else(|e| {
             eprintln!("{e}");
             std::process::exit(1);
