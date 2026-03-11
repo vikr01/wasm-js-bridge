@@ -72,7 +72,7 @@ struct BuildArgs {
 // Config (from Cargo.toml metadata)
 // ---------------------------------------------------------------------------
 
-#[derive(serde::Deserialize, Default)]
+#[derive(serde::Deserialize)]
 struct WjbMeta {
     /// Source file that contains the `bundle!` invocation (e.g. `"src/lib.rs"`).
     /// Used to derive the output stem. Default: `"src/lib.rs"`.
@@ -82,6 +82,15 @@ struct WjbMeta {
     /// Cargo features to pass when building for WASM (e.g. `"--features wasm"`).
     #[serde(default = "default_wasm_features")]
     wasm_features: String,
+}
+
+impl Default for WjbMeta {
+    fn default() -> Self {
+        Self {
+            entry: default_entry(),
+            wasm_features: default_wasm_features(),
+        }
+    }
 }
 
 fn default_entry() -> String {

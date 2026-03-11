@@ -392,10 +392,15 @@ pub fn wasm_export(attr: TokenStream, item: TokenStream) -> TokenStream {
     // to the WASM adapter and WasmFn descriptor so conditional compilation is
     // preserved. Doc attrs stay only on the original fn (already included via
     // `all_attrs`).
+    // Propagate cfg/allow/deny/warn but not doc or fn-only attrs like must_use
+    // (which is invalid on consts and helper fns).
     let non_doc_attrs: Vec<_> = func
         .attrs
         .iter()
-        .filter(|a| !a.path().is_ident("doc"))
+        .filter(|a| {
+            let path = a.path();
+            !path.is_ident("doc") && !path.is_ident("must_use")
+        })
         .collect();
     let all_attrs = &func.attrs;
 
