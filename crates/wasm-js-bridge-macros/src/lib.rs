@@ -388,17 +388,35 @@ pub fn wasm_export(attr: TokenStream, item: TokenStream) -> TokenStream {
     let flow_params_expr = params_body(&typed_params, Dialect::Flow);
     let flow_ret_expr = type_expr(&ret_ty, Dialect::Flow);
 
-    let attrs = &func.attrs;
+    // Split attrs: non-doc attrs (e.g. #[cfg(...)], #[allow(...)]) are propagated
+    // to the WASM adapter and WasmFn descriptor so conditional compilation is
+    // preserved. Doc attrs stay only on the original fn (already included via
+    // `all_attrs`).
+    let non_doc_attrs: Vec<_> = func
+        .attrs
+        .iter()
+        .filter(|a| !a.path().is_ident("doc"))
+        .collect();
+    let all_attrs = &func.attrs;
+
     let vis = &func.vis;
     let sig = &func.sig;
     let block = &func.block;
 
+    // The WasmFn descriptor and its helper fns are gated on `codegen` feature
+    // (same as bundle!) so they are only compiled when codegen is active.
+    // They additionally require ts+flow for the trait impls.
+    let descriptor_cfg = quote!(all(feature = "codegen", feature = "ts", feature = "flow"));
+
     quote! {
         // 1. Original function -- unchanged, no WASM overhead for Rust consumers
-        #(#attrs)*
+        #(#all_attrs)*
         #vis #sig #block
 
-        // 2. WASM adapter -- only compiled when wasm feature is enabled
+        // 2. WASM adapter -- only compiled when wasm feature is enabled.
+        //    Non-doc attrs (e.g. #[cfg(...)]) are propagated so the adapter
+        //    inherits the same conditional compilation as the original fn.
+        #(#non_doc_attrs)*
         #[cfg(feature = "wasm")]
         #[::wasm_bindgen::prelude::wasm_bindgen(js_name = #js_name)]
         pub fn #wasm_fn_name(
@@ -408,28 +426,34 @@ pub fn wasm_export(attr: TokenStream, item: TokenStream) -> TokenStream {
             #wasm_body
         }
 
-        // 3. WasmFn descriptor -- compiled when ts+flow features are enabled (cross-crate accessible)
-        #[cfg(all(feature = "ts", feature = "flow"))]
+        // 3. WasmFn descriptor -- compiled when codegen+ts+flow features are enabled.
+        //    Non-doc attrs are propagated so cfg-gated fns don't appear in wrong builds.
+        #(#non_doc_attrs)*
+        #[cfg(#descriptor_cfg)]
         fn #ts_params_fn() -> String {
             let cfg: ::ts_rs::Config = ::std::default::Default::default();
             #ts_params_expr
         }
-        #[cfg(all(feature = "ts", feature = "flow"))]
+        #(#non_doc_attrs)*
+        #[cfg(#descriptor_cfg)]
         fn #ts_ret_fn() -> String {
             let cfg: ::ts_rs::Config = ::std::default::Default::default();
             #ts_ret_expr
         }
-        #[cfg(all(feature = "ts", feature = "flow"))]
+        #(#non_doc_attrs)*
+        #[cfg(#descriptor_cfg)]
         fn #flow_params_fn() -> String {
             let cfg: ::flowjs_rs::Config = ::std::default::Default::default();
             #flow_params_expr
         }
-        #[cfg(all(feature = "ts", feature = "flow"))]
+        #(#non_doc_attrs)*
+        #[cfg(#descriptor_cfg)]
         fn #flow_ret_fn() -> String {
             let cfg: ::flowjs_rs::Config = ::std::default::Default::default();
             #flow_ret_expr
         }
-        #[cfg(all(feature = "ts", feature = "flow"))]
+        #(#non_doc_attrs)*
+        #[cfg(#descriptor_cfg)]
         #[doc(hidden)]
         #[allow(dead_code)]
         #vis const #const_name: ::wasm_js_bridge::WasmFn = ::wasm_js_bridge::WasmFn {
@@ -608,7 +632,7 @@ pub fn bundle(input: TokenStream) -> TokenStream {
         .collect();
 
     quote! {
-        #[cfg(all(test, feature = "codegen"))]
+        #[cfg(all(test, feature = "codegen", feature = "ts", feature = "flow"))]
         #[allow(non_snake_case)]
         mod #mod_name {
             use super::*;
@@ -635,7 +659,11 @@ pub fn bundle(input: TokenStream) -> TokenStream {
                     #(#export_consts),*
                 ];
 
-                let dir = ::std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+                // Output directory: WJB_OUT_DIR env var if set, otherwise CARGO_MANIFEST_DIR.
+                let dir = match ::std::env::var("WJB_OUT_DIR") {
+                    Ok(d) if !d.is_empty() => ::std::path::PathBuf::from(d),
+                    _ => ::std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+                };
 
                 // Group functions by source file stem. Each stem produces its own output
                 // file set. Every stem receives all type declarations so files are self-contained.
@@ -643,8 +671,26 @@ pub fn bundle(input: TokenStream) -> TokenStream {
                     ::std::string::String,
                     ::std::vec::Vec<::wasm_js_bridge::WasmFn>,
                 > = ::std::default::Default::default();
+
+                // Stem collision guard: two different source file paths must not produce
+                // the same camelCase stem, or output files would silently overwrite each other.
+                let mut stem_to_file: ::std::collections::BTreeMap<
+                    ::std::string::String,
+                    &'static str,
+                > = ::std::default::Default::default();
                 for f in all_fns {
                     let s = ::wasm_js_bridge::file_to_stem(f.file);
+                    if let Some(existing_file) = stem_to_file.get(&s) {
+                        if *existing_file != f.file {
+                            panic!(
+                                "wasm-js-bridge bundle!: stem collision — \"{}\" and \"{}\" \
+                                 both produce stem \"{}\". Rename one of the source files.",
+                                existing_file, f.file, s
+                            );
+                        }
+                    } else {
+                        stem_to_file.insert(s.clone(), f.file);
+                    }
                     by_stem.entry(s).or_default().push(*f);
                 }
 

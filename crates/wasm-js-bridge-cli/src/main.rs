@@ -291,50 +291,157 @@ fn generate_esm(wasm_path: &Path, out_dir: &Path, stem: &str) -> Result<(), Stri
 
 /// Wrap a patched CJS string as an ESM module.
 ///
-/// wasm-bindgen nodejs output uses `require` for internal helpers and
-/// `module.exports` for public API. We replace those with ESM equivalents.
-/// The `require('fs')` and `require('path')` calls have already been removed
-/// by the inlining step; the only remaining `require` calls are for
-/// `require('node:buffer')` (Buffer shim) which we replace with an import.
+/// wasm-bindgen nodejs target uses `exports.name = value` for each public
+/// export and `const { ... } = require(...)` for imports. This function
+/// converts both to their ESM equivalents. The `require('fs')` call has
+/// already been removed by the inlining step.
+///
+/// Handles:
+/// - `const { X, Y } = require('module')` → `import { X, Y } from 'module'`
+/// - `const { X: Y } = require('module')` → `import { X as Y } from 'module'`
+/// - `const mod = require('module')` → `import * as mod from 'module'`
+/// - `exports.name = value` → collected and emitted as `export { name }` stubs
+///   with the value assigned to a local binding first.
 fn cjs_to_esm(cjs: &str, _stem: &str) -> String {
-    // Replace `const { TextDecoder, TextEncoder } = require(...)` style requires
-    // with ESM imports, and `module.exports = {...}` with named exports.
-    // This is a best-effort conversion; wasm-bindgen nodejs output is consistent
-    // enough that the patterns below cover it reliably.
-    let mut out = cjs.to_string();
+    let mut esm_imports: Vec<String> = Vec::new();
+    let mut export_names: Vec<String> = Vec::new();
+    let mut out = String::with_capacity(cjs.len());
 
-    // require('node:buffer') or require('buffer') → import at top
-    if out.contains("require('buffer')") || out.contains("require(\"buffer\")") || out.contains("require('node:buffer')") {
-        out = out
-            .replace("require('buffer')", "__wjb_buffer__")
-            .replace("require(\"buffer\")", "__wjb_buffer__")
-            .replace("require('node:buffer')", "__wjb_buffer__");
-        out = format!("import * as __wjb_buffer__ from 'node:buffer';\n{out}");
+    for line in cjs.lines() {
+        let trimmed = line.trim_start();
+
+        // const { X, Y } = require('mod') or const { X: Z } = require('mod')
+        if trimmed.starts_with("const {") && trimmed.contains("} = require(") {
+            if let Some(import_stmt) = destructured_require_to_import(trimmed) {
+                esm_imports.push(import_stmt);
+                continue;
+            }
+        }
+
+        // const mod = require('mod') — namespace import
+        if trimmed.starts_with("const ") && trimmed.contains(" = require(") && !trimmed.contains('{') {
+            if let Some(import_stmt) = namespace_require_to_import(trimmed) {
+                esm_imports.push(import_stmt);
+                continue;
+            }
+        }
+
+        // exports.name = value  → collect export name, keep the assignment
+        if let Some(after_exports) = trimmed.strip_prefix("exports.") {
+            if let Some(name) = extract_exports_name(trimmed) {
+                // Rewrite as a local `let name = value` and record for re-export
+                let rest = after_exports.trim_start();
+                // rest = "name = value..."
+                if let Some(eq) = rest.find(" = ") {
+                    let value_part = &rest[eq + 3..];
+                    out.push_str("let ");
+                    out.push_str(&name);
+                    out.push_str(" = ");
+                    out.push_str(value_part);
+                    out.push('\n');
+                    export_names.push(name);
+                    continue;
+                }
+            }
+        }
+
+        out.push_str(line);
+        out.push('\n');
     }
 
-    // module.exports = { ... } → export { ... }
-    if let Some(start) = out.rfind("module.exports = {") {
-        let end = out[start..].find('}').map(|i| i + start + 1).unwrap_or(out.len());
-        let exports_block = out[start + "module.exports = ".len()..end].to_string();
-        // Extract names: { foo, bar } → export { foo, bar };
-        out.replace_range(start..end, &format!("export {exports_block}"));
+    // Prepend ESM imports
+    let mut result = String::new();
+    for imp in &esm_imports {
+        result.push_str(imp);
+        result.push('\n');
+    }
+    result.push_str(&out);
+
+    // Append named exports
+    if !export_names.is_empty() {
+        result.push_str("export { ");
+        result.push_str(&export_names.join(", "));
+        result.push_str(" };\n");
     }
 
-    out
+    result
 }
 
-fn run_cargo_test_codegen(crate_dir: &Path, pkg_name: &str) -> Result<(), String> {
+/// Convert `const { X, Y: Z } = require('mod')` to `import { X, Y as Z } from 'mod'`.
+fn destructured_require_to_import(line: &str) -> Option<String> {
+    let after_const = line.strip_prefix("const {")?;
+    let brace_end = after_const.find("} = require(")?;
+    let bindings_str = &after_const[..brace_end];
+    let after_eq = &after_const[brace_end + "} = require(".len()..];
+    // after_eq = "'mod');" or "`mod`);"
+    let module = extract_require_module(after_eq)?;
+
+    let bindings: Vec<String> = bindings_str
+        .split(',')
+        .map(|b| {
+            let b = b.trim();
+            if let Some((orig, alias)) = b.split_once(':') {
+                format!("{} as {}", orig.trim(), alias.trim())
+            } else {
+                b.to_string()
+            }
+        })
+        .filter(|b| !b.is_empty())
+        .collect();
+
+    Some(format!("import {{ {} }} from '{}';", bindings.join(", "), module))
+}
+
+/// Convert `const mod = require('mod')` to `import * as mod from 'mod'`.
+fn namespace_require_to_import(line: &str) -> Option<String> {
+    let after_const = line.strip_prefix("const ")?;
+    let eq = after_const.find(" = require(")?;
+    let name = after_const[..eq].trim();
+    let after_eq = &after_const[eq + " = require(".len()..];
+    let module = extract_require_module(after_eq)?;
+    Some(format!("import * as {name} from '{module}';"))
+}
+
+/// Extract the module name from the tail of a `require(...)` call.
+///
+/// Accepts `'mod')`, `"mod")`, `` `mod`) ``.
+fn extract_require_module(s: &str) -> Option<String> {
+    let s = s.trim_start();
+    let (quote, rest) = if let Some(r) = s.strip_prefix('\'') {
+        ('\'', r)
+    } else if let Some(r) = s.strip_prefix('"') {
+        ('"', r)
+    } else if let Some(r) = s.strip_prefix('`') {
+        ('`', r)
+    } else {
+        return None;
+    };
+    let end = rest.find(quote)?;
+    Some(rest[..end].to_string())
+}
+
+/// Extract the export name from an `exports.name = ...` line.
+fn extract_exports_name(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("exports.")?;
+    let eq = rest.find(" = ").or_else(|| rest.find('='))?;
+    let name = rest[..eq].trim().to_string();
+    if name.is_empty() { None } else { Some(name) }
+}
+
+fn run_cargo_test_codegen(crate_dir: &Path, pkg_name: &str, out_dir: &Path) -> Result<(), String> {
     let status = Command::new("cargo")
         .args([
             "test",
             "-p",
             pkg_name,
             "--features",
-            "codegen",
+            "codegen,ts,flow",
             "--",
             "generate_npm_files",
         ])
         .current_dir(crate_dir)
+        // Pass out_dir so bundle! macro writes .d.ts/.js.flow to the right place.
+        .env("WJB_OUT_DIR", out_dir)
         .status()
         .map_err(|e| format!("Failed to run cargo test: {e}"))?;
 
@@ -412,7 +519,7 @@ fn main() {
 
     if want_dts || want_flow {
         step(&format!("{stem}.{EXT_DTS} + {stem}.{EXT_FLOW}"));
-        run(run_cargo_test_codegen(&crate_dir, &pkg_name));
+        run(run_cargo_test_codegen(&crate_dir, &pkg_name, &out_dir));
     }
 
     eprintln!("wasm-js-bridge: done");
@@ -421,6 +528,55 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Actual wasm-bindgen 0.2.114 non-threaded nodejs CJS output (trimmed).
+    const WBG_CJS_NON_THREADED: &str = r#"
+'use strict';
+
+const { TextDecoder, TextEncoder } = require(`util`);
+
+let wasm;
+
+exports.parseSelector = parseSelector;
+
+const wasmPath = `${__dirname}/my_crate_bg.wasm`;
+const wasmBytes = require('fs').readFileSync(wasmPath);
+const wasmModule = new WebAssembly.Module(wasmBytes);
+let instance = new WebAssembly.Instance(wasmModule, __wbg_get_imports()).exports;
+wasm = instance;
+"#;
+
+    #[test]
+    fn cjs_to_esm_destructured_require() {
+        // Arrange and Act
+        let result = cjs_to_esm("const { TextDecoder, TextEncoder } = require(`util`);\n", "test");
+
+        // Assert
+        assert!(result.contains("import { TextDecoder, TextEncoder } from 'util'"), "should convert destructured require: {result}");
+        assert!(!result.contains("require("), "no require should remain: {result}");
+    }
+
+    #[test]
+    fn cjs_to_esm_exports_dot() {
+        // Arrange and Act
+        let result = cjs_to_esm("exports.parseSelector = parseSelector;\n", "test");
+
+        // Assert
+        assert!(result.contains("export {"), "should emit named export: {result}");
+        assert!(result.contains("parseSelector"), "export should include name: {result}");
+        assert!(!result.contains("exports."), "exports. should be rewritten: {result}");
+    }
+
+    #[test]
+    fn cjs_to_esm_non_threaded_full() {
+        // Arrange and Act
+        let result = cjs_to_esm(WBG_CJS_NON_THREADED, "myCrate");
+
+        // Assert
+        assert!(result.contains("import { TextDecoder, TextEncoder }"), "util import converted");
+        assert!(!result.contains("require(`util`)"), "util require gone");
+        assert!(result.contains("export {"), "exports.* converted to named export");
+    }
 
     #[test]
     fn file_to_stem_basic() {
