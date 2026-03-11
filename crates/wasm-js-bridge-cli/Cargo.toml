@@ -13,3 +13,4 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
+wasm-bindgen-cli-support = "0.2"
