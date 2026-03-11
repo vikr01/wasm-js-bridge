@@ -1,13 +1,13 @@
 //! wasm-js-bridge CLI — build Rust crates into npm WASM packages.
 //!
-//! Compiles to WASM via cargo, then uses wasm-bindgen-cli-support directly to
-//! emit a flat output directory:
+//! Compiles to WASM via cargo, then uses wasm-bindgen-cli-support in-memory
+//! API to emit exactly the files we want, where we want them:
 //!
 //! ```text
-//! pkg/
+//! {out_dir}/
 //!   {stem}.js          ESM (bundler target)
-//!   {stem}.cjs         CJS (nodejs target, truly CommonJS — not a .js rename trick)
-//!   {stem}_bg.wasm     shared WASM binary (both JS files import this)
+//!   {stem}.cjs         CJS (nodejs target — `.cjs` extension, not a package.json trick)
+//!   {stem}_bg.wasm     shared WASM binary
 //!   {stem}.d.ts        TypeScript declarations (via ts-rs codegen test)
 //!   {stem}.js.flow     Flow declarations (via flowjs-rs codegen test)
 //! ```
@@ -56,6 +56,10 @@ struct BuildArgs {
     /// Path to the crate directory (default: current directory).
     #[arg(long, default_value = ".")]
     path: PathBuf,
+
+    /// Output directory (default: `<crate>/pkg`).
+    #[arg(long)]
+    out_dir: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -188,82 +192,106 @@ fn cargo_build_wasm(
         .map_err(|e| format!("Failed to run cargo build: {e}"))?;
 
     if !status.success() {
-        return Err(format!("cargo build --target wasm32-unknown-unknown failed with {status}"));
+        return Err(format!(
+            "cargo build --target wasm32-unknown-unknown failed with {status}"
+        ));
     }
 
-    // cargo outputs to the workspace target dir; walk up to find it.
+    // cargo outputs to the workspace target dir; check local then walk up.
     let wasm_name = pkg_name.replace('-', "_");
-    let wasm_path = crate_dir
+    let local = crate_dir
         .join("target/wasm32-unknown-unknown/release")
         .join(format!("{wasm_name}.wasm"));
+    if local.exists() {
+        return Ok(local);
+    }
 
-    // Also try workspace root target dir (two levels up from a workspace member).
-    let wasm_path = if wasm_path.exists() {
-        wasm_path
+    let workspace = crate_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| {
+            p.join("target/wasm32-unknown-unknown/release")
+                .join(format!("{wasm_name}.wasm"))
+        })
+        .ok_or_else(|| {
+            format!(
+                "Cannot locate {wasm_name}.wasm — tried {}",
+                local.display()
+            )
+        })?;
+
+    if workspace.exists() {
+        Ok(workspace)
     } else {
-        let workspace_target = crate_dir
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("target/wasm32-unknown-unknown/release"))
-            .ok_or_else(|| format!("Cannot locate workspace target dir from {}", crate_dir.display()))?;
-        let candidate = workspace_target.join(format!("{wasm_name}.wasm"));
-        if candidate.exists() {
-            candidate
-        } else {
-            return Err(format!(
-                "Could not find {wasm_name}.wasm — tried:\n  {}\n  {}",
-                crate_dir.join("target/wasm32-unknown-unknown/release").join(format!("{wasm_name}.wasm")).display(),
-                candidate.display(),
-            ));
-        }
-    };
-
-    Ok(wasm_path)
+        Err(format!(
+            "Cannot locate {wasm_name}.wasm — tried:\n  {}\n  {}",
+            local.display(),
+            workspace.display(),
+        ))
+    }
 }
 
-/// Generate ESM `.js` + `_bg.wasm` into `out_dir` via wasm-bindgen bundler target.
+/// Generate ESM output using the wasm-bindgen in-memory API and write files
+/// directly to `out_dir`. Emits `{stem}.js` and `{stem}_bg.wasm`.
 fn generate_esm(wasm_path: &Path, out_dir: &Path, stem: &str) -> Result<(), String> {
     std::fs::create_dir_all(out_dir)
         .map_err(|e| format!("Failed to create {}: {e}", out_dir.display()))?;
 
-    Bindgen::new()
+    let mut output = Bindgen::new()
         .input_path(wasm_path)
         .bundler(true)
         .map_err(|e| format!("wasm-bindgen bundler setup failed: {e}"))?
         .out_name(stem)
-        .generate(out_dir)
-        .map_err(|e| format!("wasm-bindgen ESM generation failed: {e}"))
+        .generate_output()
+        .map_err(|e| format!("wasm-bindgen ESM generation failed: {e}"))?;
+
+    std::fs::write(out_dir.join(format!("{stem}.js")), output.js())
+        .map_err(|e| format!("Failed to write {stem}.js: {e}"))?;
+
+    std::fs::write(
+        out_dir.join(format!("{stem}_bg.wasm")),
+        output.wasm_mut().emit_wasm(),
+    )
+    .map_err(|e| format!("Failed to write {stem}_bg.wasm: {e}"))?;
+
+    Ok(())
 }
 
-/// Generate CJS `.cjs` into `out_dir` via wasm-bindgen nodejs target.
+/// Generate CJS output using the wasm-bindgen in-memory API and write files
+/// directly to `out_dir`. Emits `{stem}.cjs` — a true CJS file by extension,
+/// not a `.js` file relying on a `package.json` `"type"` field.
 ///
-/// wasm-bindgen emits `{stem}.js` (nodejs); we rename it to `{stem}.cjs` so
-/// the extension itself signals CommonJS — no `package.json` type trick needed.
-/// The WASM import path inside the generated file uses `__dirname`-relative
-/// `require()`, which stays correct as long as the `.cjs` and `_bg.wasm` are
-/// co-located in the same directory.
-fn generate_cjs(wasm_path: &Path, out_dir: &Path, stem: &str) -> Result<(), String> {
+/// The WASM binary is not re-written here; `generate_esm` already placed it.
+/// If `--cjs` is requested without `--js`, we write the WASM here instead.
+fn generate_cjs(
+    wasm_path: &Path,
+    out_dir: &Path,
+    stem: &str,
+    write_wasm: bool,
+) -> Result<(), String> {
     std::fs::create_dir_all(out_dir)
         .map_err(|e| format!("Failed to create {}: {e}", out_dir.display()))?;
 
-    Bindgen::new()
+    let mut output = Bindgen::new()
         .input_path(wasm_path)
         .nodejs(true)
         .map_err(|e| format!("wasm-bindgen nodejs setup failed: {e}"))?
         .out_name(stem)
-        .generate(out_dir)
+        .generate_output()
         .map_err(|e| format!("wasm-bindgen CJS generation failed: {e}"))?;
 
-    // Rename {stem}.js → {stem}.cjs
-    let js_path = out_dir.join(format!("{stem}.js"));
-    let cjs_path = out_dir.join(format!("{stem}.cjs"));
-    std::fs::rename(&js_path, &cjs_path).map_err(|e| {
-        format!(
-            "Failed to rename {} → {}: {e}",
-            js_path.display(),
-            cjs_path.display()
+    std::fs::write(out_dir.join(format!("{stem}.cjs")), output.js())
+        .map_err(|e| format!("Failed to write {stem}.cjs: {e}"))?;
+
+    if write_wasm {
+        std::fs::write(
+            out_dir.join(format!("{stem}_bg.wasm")),
+            output.wasm_mut().emit_wasm(),
         )
-    })
+        .map_err(|e| format!("Failed to write {stem}_bg.wasm: {e}"))?;
+    }
+
+    Ok(())
 }
 
 fn run_cargo_test_codegen(crate_dir: &Path, pkg_name: &str) -> Result<(), String> {
@@ -315,7 +343,9 @@ fn main() {
     });
 
     let stem = file_to_stem(&meta.entry);
-    let out_dir = crate_dir.join("pkg");
+    let out_dir = args
+        .out_dir
+        .unwrap_or_else(|| crate_dir.join("pkg"));
 
     eprintln!("wasm-js-bridge: {pkg_name} → stem \"{stem}\"");
 
@@ -332,7 +362,7 @@ fn main() {
         None
     };
 
-    // Step 2: ESM output
+    // Step 2: ESM output — also writes the shared _bg.wasm
     if want_js {
         eprintln!("  → {stem}.js (ESM)");
         generate_esm(wasm_path.as_ref().unwrap(), &out_dir, &stem).unwrap_or_else(|e| {
@@ -341,14 +371,15 @@ fn main() {
         });
     }
 
-    // Step 3: CJS output (shares the WASM binary already in pkg/ from ESM step,
-    // or generates its own if --cjs was requested without --js)
+    // Step 3: CJS output — writes _bg.wasm only if ESM didn't already
     if want_cjs {
         eprintln!("  → {stem}.cjs (CJS)");
-        generate_cjs(wasm_path.as_ref().unwrap(), &out_dir, &stem).unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(1);
-        });
+        generate_cjs(wasm_path.as_ref().unwrap(), &out_dir, &stem, !want_js).unwrap_or_else(
+            |e| {
+                eprintln!("{e}");
+                std::process::exit(1);
+            },
+        );
     }
 
     // Step 4: Type declarations (.d.ts + .js.flow via cargo test codegen)
