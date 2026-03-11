@@ -378,44 +378,41 @@ fn main() {
 
     eprintln!("wasm-js-bridge: {pkg_name} → stem \"{stem}\"");
 
+    let step = |outputs: &str| eprintln!("  → {outputs}");
+    let run = |result: Result<(), String>| {
+        result.unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1);
+        })
+    };
+    let run_t = |result: Result<PathBuf, String>| {
+        result.unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1);
+        })
+    };
+
     // Step 1: Compile to WASM (needed for --js or --cjs)
     let wasm_path = if want_js || want_cjs {
-        eprintln!("  → cargo build --target wasm32-unknown-unknown");
-        let path = cargo_build_wasm(&crate_dir, &pkg_name, &meta.wasm_features)
-            .unwrap_or_else(|e| {
-                eprintln!("{e}");
-                std::process::exit(1);
-            });
-        Some(path)
+        step("cargo build --target wasm32-unknown-unknown");
+        Some(run_t(cargo_build_wasm(&crate_dir, &pkg_name, &meta.wasm_features)))
     } else {
         None
     };
 
-    // Step 2: ESM output — WASM inlined, no _bg.wasm written
     if want_js {
-        eprintln!("  → {stem}.{EXT_ESM} (ESM, WASM inlined)");
-        generate_esm(wasm_path.as_ref().unwrap(), &out_dir, &stem).unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(1);
-        });
+        step(&format!("{stem}.{EXT_ESM}"));
+        run(generate_esm(wasm_path.as_ref().unwrap(), &out_dir, &stem));
     }
 
-    // Step 3: CJS output — WASM inlined, no _bg.wasm written
     if want_cjs {
-        eprintln!("  → {stem}.{EXT_CJS} (CJS, WASM inlined)");
-        generate_cjs(wasm_path.as_ref().unwrap(), &out_dir, &stem).unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(1);
-        });
+        step(&format!("{stem}.{EXT_CJS}"));
+        run(generate_cjs(wasm_path.as_ref().unwrap(), &out_dir, &stem));
     }
 
-    // Step 4: Type declarations (.d.ts + .js.flow via cargo test codegen)
     if want_dts || want_flow {
-        eprintln!("  → {stem}.{EXT_DTS} + {stem}.{EXT_FLOW} (codegen)");
-        run_cargo_test_codegen(&crate_dir, &pkg_name).unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(1);
-        });
+        step(&format!("{stem}.{EXT_DTS} + {stem}.{EXT_FLOW}"));
+        run(run_cargo_test_codegen(&crate_dir, &pkg_name));
     }
 
     eprintln!("wasm-js-bridge: done");
