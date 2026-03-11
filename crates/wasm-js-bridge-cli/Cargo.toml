@@ -1,0 +1,15 @@
+[package]
+name = "wasm-js-bridge-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI build tool for packaging Rust crates as npm WASM packages"
+
+[[bin]]
+name = "wasm-js-bridge"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }

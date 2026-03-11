@@ -1,0 +1,24 @@
+[package]
+name = "wasm-js-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Build tool for packaging Rust crates as npm WASM packages with TypeScript and Flow types"
+
+[dependencies]
+wasm-js-bridge-macros = { version = "0.1.0", path = "../wasm-js-bridge-macros" }
+
+[dependencies.ts-rs]
+version = "12"
+features = ["serde-json-impl", "no-serde-warnings"]
+optional = true
+
+[dependencies.flowjs-rs]
+path = "../../../flowjs-rs/crates/flowjs-rs"
+features = ["serde-json-impl"]
+optional = true
+
+[features]
+default = []
+ts = ["dep:ts-rs"]
+flow = ["dep:flowjs-rs"]
