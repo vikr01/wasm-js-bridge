@@ -144,6 +144,14 @@ struct WjbMeta {
     /// Default when absent: `{ ".": "src/lib.rs" }`.
     #[serde(default)]
     exports: std::collections::BTreeMap<String, String>,
+
+    /// Explicit peer npm package names to emit as `peerDependencies`.
+    ///
+    /// Each entry is emitted as `"<name>": "workspace:*"`.
+    /// Use this to declare peers that are not resolvable from Cargo deps
+    /// (e.g. packages in the same workspace whose Cargo dep is optional).
+    #[serde(default)]
+    peers: Vec<String>,
 }
 
 impl Default for WjbMeta {
@@ -155,6 +163,7 @@ impl Default for WjbMeta {
             dts: true,
             jsflow: false,
             exports: std::collections::BTreeMap::new(),
+            peers: Vec::new(),
         }
     }
 }
@@ -941,10 +950,18 @@ fn generate_package_json(
     // Monorepo sibling packages are peers: the WASM binary is self-contained
     // (they are compiled in for Rust type use), but npm should not try to
     // deduplicate or bundle them — consumers install them independently.
-    if !npm_deps.is_empty() {
+    // Explicit `peers` entries from Cargo.toml metadata supplement the
+    // auto-resolved deps, emitted as `"workspace:*"` versions.
+    let mut all_peer_deps = npm_deps;
+    for peer_name in &meta.peers {
+        all_peer_deps
+            .entry(peer_name.clone())
+            .or_insert_with(|| "workspace:*".to_string());
+    }
+    if !all_peer_deps.is_empty() {
         pkg.insert(
             "peerDependencies".to_string(),
-            serde_json::to_value(&npm_deps).unwrap(),
+            serde_json::to_value(&all_peer_deps).unwrap(),
         );
     }
 

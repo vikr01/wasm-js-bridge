@@ -1,0 +1,14 @@
+#!/usr/bin/env sh
+# Pre-commit: auto-format all staged TOML files with taplo, then restage them.
+set -e
+
+command -v taplo > /dev/null 2>&1 || {
+  echo "[pre-commit] taplo not found. Install: cargo install taplo-cli" >&2
+  exit 1
+}
+
+staged=$(git diff --cached --name-only --diff-filter=ACM | grep '\.toml$' || true)
+[ -z "$staged" ] && exit 0
+
+echo "$staged" | xargs taplo fmt
+echo "$staged" | xargs git add

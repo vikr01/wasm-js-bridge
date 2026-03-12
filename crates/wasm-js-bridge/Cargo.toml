@@ -7,7 +7,7 @@ description = "Build tool for packaging Rust crates as npm WASM packages with Ty
 repository.workspace = true
 
 [dependencies]
-wasm-js-bridge-macros = { version = "0.1.0", path = "../wasm-js-bridge-macros" }
+wasm-js-bridge-macros = { version = "0.1.1", path = "../wasm-js-bridge-macros" }
 
 [dependencies.ts-rs]
 version = "12"

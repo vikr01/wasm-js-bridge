@@ -1,13 +1,13 @@
 [workspace]
 members = [
-    "crates/wasm-js-bridge",
-    "crates/wasm-js-bridge-macros",
-    "crates/wasm-js-bridge-cli",
+  "crates/wasm-js-bridge",
+  "crates/wasm-js-bridge-macros",
+  "crates/wasm-js-bridge-cli",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/vikr01/wasm-js-bridge"
