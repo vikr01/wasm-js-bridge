@@ -15,7 +15,7 @@ features = ["serde-json-impl", "no-serde-warnings"]
 optional = true
 
 [dependencies.flowjs-rs]
-version = "0.3.0"
+version = "0.3.1"
 path = "../../../flowjs-rs/crates/flowjs-rs"
 features = ["serde-json-impl"]
 optional = true
