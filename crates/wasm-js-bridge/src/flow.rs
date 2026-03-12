@@ -109,7 +109,6 @@ fn extract_type_name(decl: &str) -> &str {
     ""
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,10 +317,6 @@ mod tests {
             "TagName",
             "declare export opaque type"
         );
-        assert_eq!(
-            extract_type_name("type Bar = number;"),
-            "Bar",
-            "plain type"
-        );
+        assert_eq!(extract_type_name("type Bar = number;"), "Bar", "plain type");
     }
 }

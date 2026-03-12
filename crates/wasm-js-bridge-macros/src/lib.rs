@@ -87,6 +87,28 @@ fn unwrap_result(ty: &Type) -> Option<(&Type, &Type)> {
     None
 }
 
+fn contains_nested_reference(ty: &Type) -> bool {
+    match ty {
+        Type::Reference(_) => true,
+        Type::Array(a) => contains_nested_reference(&a.elem),
+        Type::Group(g) => contains_nested_reference(&g.elem),
+        Type::Paren(p) => contains_nested_reference(&p.elem),
+        Type::Slice(s) => contains_nested_reference(&s.elem),
+        Type::Tuple(t) => t.elems.iter().any(contains_nested_reference),
+        Type::Path(p) => p.path.segments.iter().any(|seg| {
+            if let PathArguments::AngleBracketed(args) = &seg.arguments {
+                args.args.iter().any(|arg| match arg {
+                    GenericArgument::Type(inner) => contains_nested_reference(inner),
+                    _ => false,
+                })
+            } else {
+                false
+            }
+        }),
+        _ => false,
+    }
+}
+
 /// Strip any `r#` raw-identifier prefix from a param ident before emitting as JS.
 fn js_param_name(ident: &syn::Ident) -> String {
     let s = ident.to_string();
@@ -107,13 +129,21 @@ fn wasm_param(name: &syn::Ident, ty: &Type) -> (TokenStream2, TokenStream2) {
     } else if let Type::Reference(r) = ty {
         if r.mutability.is_some() {
             return (
-                syn::Error::new_spanned(ty, "#[wasm_export] does not support &mut T params; take T by value").to_compile_error(),
+                syn::Error::new_spanned(
+                    ty,
+                    "#[wasm_export] does not support &mut T params; take T by value",
+                )
+                .to_compile_error(),
                 quote!(),
             );
         }
         if matches!(r.elem.as_ref(), Type::Slice(_)) {
             return (
-                syn::Error::new_spanned(ty, "#[wasm_export] does not support &[T] params; use Vec<T>").to_compile_error(),
+                syn::Error::new_spanned(
+                    ty,
+                    "#[wasm_export] does not support &[T] params; use Vec<T>",
+                )
+                .to_compile_error(),
                 quote!(),
             );
         }
@@ -134,6 +164,15 @@ fn wasm_param(name: &syn::Ident, ty: &Type) -> (TokenStream2, TokenStream2) {
         (quote!(#name: bool), quote!())
     } else if is_numeric(ty) {
         (quote!(#name: #ty), quote!())
+    } else if contains_nested_reference(ty) {
+        (
+            syn::Error::new_spanned(
+                ty,
+                "#[wasm_export] does not support borrowed references inside generic/container types (e.g. Option<&T>, Vec<&T>); use owned data",
+            )
+            .to_compile_error(),
+            quote!(),
+        )
     } else {
         (
             quote!(#name: ::wasm_bindgen::JsValue),
@@ -287,8 +326,9 @@ fn snake_to_screaming(s: &str) -> String {
 /// 1. The original function, unchanged -- works for any Rust consumer.
 /// 2. A `#[wasm_bindgen]` adapter under `#[cfg(feature = "wasm")]` that
 ///    deserializes complex params via `serde_wasm_bindgen` and serializes output.
-/// 3. A `WasmFn` const descriptor + helper fns under `#[cfg(all(feature = "ts", feature = "flow"))]`
-///    for npm package codegen (used by `bundle!`); accessible cross-crate when ts+flow enabled.
+/// 3. A `WasmFn` const descriptor + helper fns under
+///    `#[cfg(all(feature = "codegen", any(feature = "ts", feature = "flow")))]`
+///    for npm package codegen (used by `bundle!`).
 ///
 /// # Example
 ///
@@ -331,7 +371,10 @@ pub fn wasm_export(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_name_bare = fn_name_str.strip_prefix("r#").unwrap_or(&fn_name_str);
     let js_name = snake_to_camel(fn_name_bare);
     let wasm_fn_name = format_ident!("__wasm_{}", fn_name);
-    let const_name = format_ident!("_WASM_JS_BRIDGE_{}", snake_to_screaming(&fn_name.to_string()));
+    let const_name = format_ident!(
+        "_WASM_JS_BRIDGE_{}",
+        snake_to_screaming(&fn_name.to_string())
+    );
     let ts_params_fn = format_ident!("__wjb_ts_params_{}", fn_name);
     let ts_ret_fn = format_ident!("__wjb_ts_ret_{}", fn_name);
     let flow_params_fn = format_ident!("__wjb_flow_params_{}", fn_name);
@@ -408,10 +451,13 @@ pub fn wasm_export(attr: TokenStream, item: TokenStream) -> TokenStream {
     let sig = &func.sig;
     let block = &func.block;
 
-    // The WasmFn descriptor and its helper fns are gated on `codegen` feature
-    // (same as bundle!) so they are only compiled when codegen is active.
-    // They additionally require ts+flow for the trait impls.
-    let descriptor_cfg = quote!(all(feature = "codegen", feature = "ts", feature = "flow"));
+    // The WasmFn descriptor is gated on codegen + at least one declaration target.
+    // Each helper fn has a real implementation for its feature and a fallback
+    // implementation otherwise, so descriptor emission works with ts-only or flow-only.
+    let descriptor_cfg = quote!(all(
+        feature = "codegen",
+        any(feature = "ts", feature = "flow")
+    ));
 
     quote! {
         // 1. Original function -- unchanged, no WASM overhead for Rust consumers
@@ -434,28 +480,48 @@ pub fn wasm_export(attr: TokenStream, item: TokenStream) -> TokenStream {
         // 3. WasmFn descriptor -- compiled when codegen+ts+flow features are enabled.
         //    Non-doc attrs are propagated so cfg-gated fns don't appear in wrong builds.
         #(#non_doc_attrs)*
-        #[cfg(#descriptor_cfg)]
+        #[cfg(all(feature = "codegen", feature = "ts"))]
         fn #ts_params_fn() -> String {
             let cfg: ::ts_rs::Config = ::std::default::Default::default();
             #ts_params_expr
         }
         #(#non_doc_attrs)*
-        #[cfg(#descriptor_cfg)]
+        #[cfg(all(feature = "codegen", not(feature = "ts")))]
+        fn #ts_params_fn() -> String {
+            "any".to_string()
+        }
+        #(#non_doc_attrs)*
+        #[cfg(all(feature = "codegen", feature = "ts"))]
         fn #ts_ret_fn() -> String {
             let cfg: ::ts_rs::Config = ::std::default::Default::default();
             #ts_ret_expr
         }
         #(#non_doc_attrs)*
-        #[cfg(#descriptor_cfg)]
+        #[cfg(all(feature = "codegen", not(feature = "ts")))]
+        fn #ts_ret_fn() -> String {
+            "any".to_string()
+        }
+        #(#non_doc_attrs)*
+        #[cfg(all(feature = "codegen", feature = "flow"))]
         fn #flow_params_fn() -> String {
             let cfg: ::flowjs_rs::Config = ::std::default::Default::default();
             #flow_params_expr
         }
         #(#non_doc_attrs)*
-        #[cfg(#descriptor_cfg)]
+        #[cfg(all(feature = "codegen", not(feature = "flow")))]
+        fn #flow_params_fn() -> String {
+            "any".to_string()
+        }
+        #(#non_doc_attrs)*
+        #[cfg(all(feature = "codegen", feature = "flow"))]
         fn #flow_ret_fn() -> String {
             let cfg: ::flowjs_rs::Config = ::std::default::Default::default();
             #flow_ret_expr
+        }
+        #(#non_doc_attrs)*
+        #[cfg(all(feature = "codegen", not(feature = "flow")))]
+        fn #flow_ret_fn() -> String {
+            "any".to_string()
         }
         #(#non_doc_attrs)*
         #[cfg(#descriptor_cfg)]
@@ -579,7 +645,8 @@ impl syn::parse::Parse for BundleArgs {
     }
 }
 
-/// Generate `#[test] fn generate_npm_files()` that writes `.d.ts` and `.js.flow` output files.
+/// Generate `#[test] fn generate_npm_files()` that writes `.d.ts` and/or
+/// `.js.flow` output files depending on enabled features.
 ///
 /// Groups functions by source file stem and writes one output file set per stem.
 /// `"src/lib.rs"` -> `"lib"`, `"src/foo_bar.rs"` -> `"fooBar"`, `"src/wasm.rs"` -> `"wasm"`.
@@ -594,6 +661,49 @@ impl syn::parse::Parse for BundleArgs {
 ///     opaque  = [],
 /// }
 /// ```
+/// Inject WASM peer imports for npm-packaged dependencies.
+///
+/// When `WJB_PEER_SHIM` is set (by `wasm-js-bridge build-workspace`), reads
+/// the shim file and emits its contents — a `#[wasm_bindgen(module = "...")]
+/// extern "C" { ... }` block that imports each peer's exported functions.
+///
+/// When `WJB_PEER_SHIM` is not set (direct `cargo build`, tests, native builds),
+/// expands to nothing. Call once near the top of the crate root.
+///
+/// ```rust,ignore
+/// // In lib.rs or wasm.rs:
+/// wasm_js_bridge::wasm_peers!();
+/// ```
+#[proc_macro]
+pub fn wasm_peers(_input: TokenStream) -> TokenStream {
+    let shim_path = match std::env::var("WJB_PEER_SHIM") {
+        Ok(p) => p,
+        Err(_) => return TokenStream::new(),
+    };
+
+    let content = match std::fs::read_to_string(&shim_path) {
+        Ok(s) => s,
+        Err(e) => {
+            return syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!("Failed to read WJB_PEER_SHIM {shim_path}: {e}"),
+            )
+            .to_compile_error()
+            .into()
+        }
+    };
+
+    match content.parse::<TokenStream2>() {
+        Ok(ts) => ts.into(),
+        Err(e) => syn::Error::new(
+            proc_macro2::Span::call_site(),
+            format!("Invalid peer shim: {e}"),
+        )
+        .to_compile_error()
+        .into(),
+    }
+}
+
 #[proc_macro]
 pub fn bundle(input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(input as BundleArgs);
@@ -603,7 +713,9 @@ pub fn bundle(input: TokenStream) -> TokenStream {
     let mod_name = {
         let span = proc_macro2::Span::call_site();
         let src = format!("{span:?}");
-        let hash: u64 = src.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+        let hash: u64 = src
+            .bytes()
+            .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
         format_ident!("__wjb_bundle_{:016x}", hash)
     };
 
@@ -621,9 +733,7 @@ pub fn bundle(input: TokenStream) -> TokenStream {
     let alias_items: Vec<TokenStream2> = args
         .aliases
         .iter()
-        .map(|(name, target)| {
-            quote!(::wasm_js_bridge::TypeAlias { name: #name, target: #target })
-        })
+        .map(|(name, target)| quote!(::wasm_js_bridge::TypeAlias { name: #name, target: #target }))
         .collect();
 
     // opaque types
@@ -637,25 +747,33 @@ pub fn bundle(input: TokenStream) -> TokenStream {
         .collect();
 
     quote! {
-        #[cfg(all(test, feature = "codegen", feature = "ts", feature = "flow"))]
+        #[cfg(all(test, feature = "codegen", any(feature = "ts", feature = "flow")))]
         #[allow(non_snake_case)]
         mod #mod_name {
             use super::*;
 
             #[test]
             fn generate_npm_files() {
+                #[cfg(feature = "ts")]
                 use ::ts_rs::TS as _;
+                #[cfg(feature = "flow")]
                 use ::flowjs_rs::Flow as _;
 
-                let ts_cfg: ::ts_rs::Config = ::std::default::Default::default();
-                let flow_cfg: ::flowjs_rs::Config = ::std::default::Default::default();
+                #[cfg(feature = "ts")]
+                let ts_decls: ::std::vec::Vec<::std::string::String> = {
+                    let ts_cfg: ::ts_rs::Config = ::std::default::Default::default();
+                    ::std::vec![
+                        #(<#types as ::ts_rs::TS>::decl(&ts_cfg)),*
+                    ]
+                };
 
-                let ts_decls: ::std::vec::Vec<::std::string::String> = ::std::vec![
-                    #(<#types as ::ts_rs::TS>::decl(&ts_cfg)),*
-                ];
-                let flow_decls: ::std::vec::Vec<::std::string::String> = ::std::vec![
-                    #(<#types as ::flowjs_rs::Flow>::decl(&flow_cfg)),*
-                ];
+                #[cfg(feature = "flow")]
+                let flow_decls: ::std::vec::Vec<::std::string::String> = {
+                    let flow_cfg: ::flowjs_rs::Config = ::std::default::Default::default();
+                    ::std::vec![
+                        #(<#types as ::flowjs_rs::Flow>::decl(&flow_cfg)),*
+                    ]
+                };
 
                 let aliases: &[::wasm_js_bridge::TypeAlias] = &[#(#alias_items),*];
                 let opaque: &[::wasm_js_bridge::OpaqueType] = &[#(#opaque_items),*];
@@ -669,6 +787,7 @@ pub fn bundle(input: TokenStream) -> TokenStream {
                     Ok(d) if !d.is_empty() => ::std::path::PathBuf::from(d),
                     _ => ::std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
                 };
+                ::std::fs::create_dir_all(&dir).expect("Failed to create output directory");
 
                 // Group functions by source file stem. Each stem produces its own output
                 // file set. Every stem receives all type declarations so files are self-contained.
@@ -706,12 +825,18 @@ pub fn bundle(input: TokenStream) -> TokenStream {
                 }
 
                 for (stem, fns) in &by_stem {
-                    let dts = ::wasm_js_bridge::generate_index_dts(&ts_decls, aliases, &[], fns);
-                    let flow = ::wasm_js_bridge::generate_index_flow(&flow_decls, aliases, &[], fns, opaque);
-                    ::std::fs::write(dir.join(format!("{stem}.d.ts")), dts)
-                        .expect("Failed to write .d.ts");
-                    ::std::fs::write(dir.join(format!("{stem}.js.flow")), flow)
-                        .expect("Failed to write .js.flow");
+                    #[cfg(feature = "ts")]
+                    {
+                        let dts = ::wasm_js_bridge::generate_index_dts(&ts_decls, aliases, &[], fns);
+                        ::std::fs::write(dir.join(format!("{stem}.d.ts")), dts)
+                            .expect("Failed to write .d.ts");
+                    }
+                    #[cfg(feature = "flow")]
+                    {
+                        let flow = ::wasm_js_bridge::generate_index_flow(&flow_decls, aliases, &[], fns, opaque);
+                        ::std::fs::write(dir.join(format!("{stem}.js.flow")), flow)
+                            .expect("Failed to write .js.flow");
+                    }
                 }
             }
         }
@@ -749,5 +874,27 @@ mod tests {
             "underscore preserved"
         );
         assert_eq!(snake_to_screaming("select"), "SELECT", "single word");
+    }
+
+    #[test]
+    fn detects_nested_reference_types() {
+        // Arrange
+        let ty_option_ref: Type = syn::parse_quote!(Option<&str>);
+        let ty_vec_ref: Type = syn::parse_quote!(Vec<&MyType>);
+        let ty_owned: Type = syn::parse_quote!(Option<String>);
+
+        // Act and Assert
+        assert!(
+            contains_nested_reference(&ty_option_ref),
+            "Option<&T> should be rejected"
+        );
+        assert!(
+            contains_nested_reference(&ty_vec_ref),
+            "Vec<&T> should be rejected"
+        );
+        assert!(
+            !contains_nested_reference(&ty_owned),
+            "owned generic types should be allowed"
+        );
     }
 }

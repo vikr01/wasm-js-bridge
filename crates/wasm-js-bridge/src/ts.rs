@@ -44,7 +44,6 @@ pub fn generate_index_dts(
     out
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,11 +61,7 @@ mod tests {
         "ReadonlyArray<Annotation>".to_string()
     }
 
-    fn make_fn(
-        name: &'static str,
-        ts_params: fn() -> String,
-        ts_ret: fn() -> String,
-    ) -> WasmFn {
+    fn make_fn(name: &'static str, ts_params: fn() -> String, ts_ret: fn() -> String) -> WasmFn {
         WasmFn {
             name,
             file: "src/lib.rs",

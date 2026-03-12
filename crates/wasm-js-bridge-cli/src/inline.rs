@@ -70,9 +70,8 @@ fn patch_wasm_load(js: &str, replacement: &str) -> Option<String> {
 /// `require('fs')` call are handled, and leading whitespace before either line
 /// is tolerated.
 fn replace_pattern_a(js: &str, replacement: &str) -> Option<String> {
-    // Locate the wasmPath assignment (backtick template literal, may be indented)
-    let path_key = "__dirname}/";
-    let path_marker_end = js.find(path_key)?;
+    // Locate the wasmPath assignment (template literal, may be indented)
+    let path_marker_end = js.find("_bg.wasm")?;
     // Walk back to find the start of the statement
     let path_line_start = js[..path_marker_end]
         .rfind('\n')
@@ -85,11 +84,17 @@ fn replace_pattern_a(js: &str, replacement: &str) -> Option<String> {
         .find('\n')
         .map(|i| i + path_line_start)
         .unwrap_or(js.len());
+    let path_line = &js[path_line_start..path_line_end];
+    if !path_line.contains("__dirname}/") {
+        return None;
+    }
+    if path_line_end >= js.len() {
+        return None;
+    }
 
     // The wasmBytes / module assignment must follow on the very next non-blank line.
     let after_path = &js[path_line_end + 1..];
-    let bytes_needle = "require('fs').readFileSync(";
-    let bytes_rel = after_path.find(bytes_needle)?;
+    let (bytes_rel, bytes_needle) = find_fs_readfilesync(after_path)?;
     // The text before `require('fs')` on that line is the LHS assignment; there
     // must be no additional newlines containing non-whitespace content between
     // the path line and the require call (i.e. at most one intervening line).
@@ -115,10 +120,7 @@ fn replace_pattern_a(js: &str, replacement: &str) -> Option<String> {
         .unwrap_or(bytes_call_end);
 
     // Walk back from bytes_start to find the beginning of the statement's line
-    let bytes_line_start = js[..bytes_start]
-        .rfind('\n')
-        .map(|i| i + 1)
-        .unwrap_or(0);
+    let bytes_line_start = js[..bytes_start].rfind('\n').map(|i| i + 1).unwrap_or(0);
 
     // Reconstruct: keep everything before the path line, then replace both
     // lines with a single assignment using the inline expression.
@@ -143,8 +145,7 @@ fn replace_pattern_a(js: &str, replacement: &str) -> Option<String> {
 /// require('fs').readFileSync(require('path').join(__dirname, '…_bg.wasm'))
 /// ```
 fn replace_pattern_b(js: &str, replacement: &str) -> Option<String> {
-    let needle = "require('fs').readFileSync(";
-    let start = js.find(needle)?;
+    let (start, needle) = find_fs_readfilesync(js)?;
     let args_start = start + needle.len();
     let close = find_matching_paren(&js[args_start..])? + args_start;
     let end = close + 1;
@@ -154,6 +155,20 @@ fn replace_pattern_b(js: &str, replacement: &str) -> Option<String> {
     out.push_str(replacement);
     out.push_str(&js[end..]);
     Some(out)
+}
+
+/// Find a `require("fs").readFileSync(` call and return `(byte_offset, needle)`.
+fn find_fs_readfilesync(s: &str) -> Option<(usize, &'static str)> {
+    const NEEDLES: [&str; 3] = [
+        "require('fs').readFileSync(",
+        "require(\"fs\").readFileSync(",
+        "require(`fs`).readFileSync(",
+    ];
+
+    NEEDLES
+        .iter()
+        .filter_map(|needle| s.find(needle).map(|idx| (idx, *needle)))
+        .min_by_key(|(idx, _)| *idx)
 }
 
 /// Find the index of the closing `)` that matches the opening `(` assumed to
@@ -233,9 +248,15 @@ if (require('worker_threads').isMainThread) {
         let result = inline_wasm_cjs(WBG_NON_THREADED, FAKE_WASM).unwrap();
 
         // Assert
-        assert!(!result.contains("require('fs')"), "fs.readFileSync should be gone");
+        assert!(
+            !result.contains("require('fs')"),
+            "fs.readFileSync should be gone"
+        );
         assert!(!result.contains("wasmPath"), "wasmPath var should be gone");
-        assert!(result.contains("Buffer.from("), "should contain inline bytes");
+        assert!(
+            result.contains("Buffer.from("),
+            "should contain inline bytes"
+        );
         assert!(result.contains("'base64'"), "should use base64 encoding");
     }
 
@@ -245,10 +266,19 @@ if (require('worker_threads').isMainThread) {
         let result = inline_wasm_cjs(WBG_THREADED, FAKE_WASM).unwrap();
 
         // Assert
-        assert!(!result.contains("require('fs')"), "fs.readFileSync should be gone");
-        assert!(result.contains("Buffer.from("), "should contain inline bytes");
+        assert!(
+            !result.contains("require('fs')"),
+            "fs.readFileSync should be gone"
+        );
+        assert!(
+            result.contains("Buffer.from("),
+            "should contain inline bytes"
+        );
         // The worker_threads require should still be present (different require)
-        assert!(result.contains("require('worker_threads')"), "worker_threads require should remain");
+        assert!(
+            result.contains("require('worker_threads')"),
+            "worker_threads require should remain"
+        );
     }
 
     #[test]
@@ -257,8 +287,14 @@ if (require('worker_threads').isMainThread) {
         let result = inline_wasm_esm(WBG_NON_THREADED, FAKE_WASM).unwrap();
 
         // Assert
-        assert!(result.contains("Uint8Array.from(atob("), "ESM should use Uint8Array + atob");
-        assert!(!result.contains("Buffer.from("), "ESM should not use Buffer");
+        assert!(
+            result.contains("Uint8Array.from(atob("),
+            "ESM should use Uint8Array + atob"
+        );
+        assert!(
+            !result.contains("Buffer.from("),
+            "ESM should not use Buffer"
+        );
     }
 
     #[test]
@@ -283,7 +319,51 @@ if (require('worker_threads').isMainThread) {
         let result = inline_wasm_cjs(js, FAKE_WASM).unwrap();
 
         // Assert
-        assert!(!result.contains("require('fs')"), "fs.readFileSync should be gone");
-        assert!(result.contains("Buffer.from("), "should contain inline bytes");
+        assert!(
+            !result.contains("require('fs')"),
+            "fs.readFileSync should be gone"
+        );
+        assert!(
+            result.contains("Buffer.from("),
+            "should contain inline bytes"
+        );
+    }
+
+    #[test]
+    fn inline_cjs_handles_double_quote_require() {
+        // Arrange
+        let js = r#"
+const wasmPath = `${__dirname}/foo_bg.wasm`;
+const wasmBytes = require("fs").readFileSync(wasmPath);
+"#;
+
+        // Act
+        let result = inline_wasm_cjs(js, FAKE_WASM).unwrap();
+
+        // Assert
+        assert!(
+            !result.contains("require(\"fs\")"),
+            "double-quote fs require should be rewritten"
+        );
+        assert!(result.contains("Buffer.from("), "should inline wasm bytes");
+    }
+
+    #[test]
+    fn inline_cjs_handles_backtick_require() {
+        // Arrange
+        let js = r#"
+const wasmPath = `${__dirname}/foo_bg.wasm`;
+module = require(`fs`).readFileSync(wasmPath);
+"#;
+
+        // Act
+        let result = inline_wasm_cjs(js, FAKE_WASM).unwrap();
+
+        // Assert
+        assert!(
+            !result.contains("require(`fs`)"),
+            "backtick fs require should be rewritten"
+        );
+        assert!(result.contains("Buffer.from("), "should inline wasm bytes");
     }
 }

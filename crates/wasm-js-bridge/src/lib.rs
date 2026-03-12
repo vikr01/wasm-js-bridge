@@ -8,10 +8,10 @@ mod types;
 mod flow;
 mod ts;
 
-pub use wasm_js_bridge_macros::{bundle, wasm_export};
 pub use flow::{generate_index_flow, OpaqueType};
 pub use ts::generate_index_dts;
 pub use types::{Interface, TypeAlias, WasmFn};
+pub use wasm_js_bridge_macros::{bundle, wasm_export, wasm_peers};
 
 /// Convert a `file!()` path to a camelCase output file stem.
 ///
@@ -27,10 +27,16 @@ pub fn file_to_stem(file: &str) -> String {
         .unwrap_or("unknown");
     let base = if stem == "mod" {
         // mod.rs → use parent directory name
-        path.parent()
+        let parent = path
+            .parent()
             .and_then(|p| p.file_name())
             .and_then(|s| s.to_str())
-            .unwrap_or("mod")
+            .unwrap_or("mod");
+        if parent == "src" {
+            "mod"
+        } else {
+            parent
+        }
     } else {
         stem
     };
@@ -69,12 +75,29 @@ mod tests {
 
     #[test]
     fn file_to_stem_snake_case() {
-        assert_eq!(file_to_stem("src/foo_bar.rs"), "fooBar", "snake_case → camelCase");
+        assert_eq!(
+            file_to_stem("src/foo_bar.rs"),
+            "fooBar",
+            "snake_case → camelCase"
+        );
     }
 
     #[test]
     fn file_to_stem_mod_rs() {
-        assert_eq!(file_to_stem("src/query/mod.rs"), "query", "mod.rs → parent dir");
+        assert_eq!(
+            file_to_stem("src/query/mod.rs"),
+            "query",
+            "mod.rs → parent dir"
+        );
+    }
+
+    #[test]
+    fn file_to_stem_root_mod_rs() {
+        assert_eq!(
+            file_to_stem("src/mod.rs"),
+            "mod",
+            "root mod.rs should not become src"
+        );
     }
 
     #[test]
