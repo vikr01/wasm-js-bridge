@@ -1,7 +1,8 @@
 //! wasm-js-bridge CLI — build Rust crates into npm WASM packages.
 //!
-//! Compiles to WASM via cargo, then uses wasm-bindgen-cli-support in-memory
-//! API to emit fully self-contained JS files with the WASM binary inlined:
+//! Compiles to WASM via cargo, invokes the `wasm-bindgen` CLI from PATH to
+//! produce JS bindings, then inlines the WASM binary as base64 so no external
+//! `.wasm` file is needed at runtime.
 //!
 //! ```text
 //! {out_dir}/
@@ -11,9 +12,18 @@
 //!   {stem}.js.flow Flow declarations (via flowjs-rs codegen test)
 //! ```
 //!
+//! The `wasm-bindgen` CLI version must match the `wasm-bindgen` crate version
+//! used by the target crate. Install the matching version with:
+//!
+//! ```sh
+//! cargo install wasm-bindgen-cli --version <version>
+//! ```
+//!
 //! Source filename → output stem: `foo_bar.rs` → `fooBar`, `mod.rs` → parent dir name.
 
 mod inline;
+mod logger;
+mod peer;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -24,7 +34,6 @@ const EXT_DTS: &str = "d.ts";
 const EXT_FLOW: &str = "js.flow";
 
 use clap::Parser;
-use wasm_bindgen_cli_support::Bindgen;
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -33,29 +42,40 @@ use wasm_bindgen_cli_support::Bindgen;
 #[derive(Parser)]
 #[command(name = "wasm-js-bridge", about = "Package Rust crates as npm WASM packages")]
 enum Cli {
-    /// Build the crate into an npm package.
+    /// Build a single crate into an npm package.
     Build(BuildArgs),
+    /// Build all npm-packaged crates in the workspace in dependency order,
+    /// wiring WASM peer imports between packages automatically.
+    BuildWorkspace(BuildWorkspaceArgs),
+}
+
+#[derive(Parser)]
+struct BuildWorkspaceArgs {
+    /// Output directory root. Each package is written to `<out_dir>/<pkg_name>/`.
+    #[arg(long)]
+    out_dir: Option<PathBuf>,
 }
 
 #[derive(Parser)]
 struct BuildArgs {
-    /// Output ESM `.js`.
+    /// Override: produce ESM `.js` (always on by default; this flag is a no-op unless
+    /// combined with other flags to be explicit).
     #[arg(long)]
     js: bool,
 
-    /// Output CJS `.cjs`.
+    /// Override: produce CJS `.cjs` (default from metadata; flag forces it on).
     #[arg(long)]
     cjs: bool,
 
-    /// Output TypeScript declarations (`.d.ts`) via ts-rs.
+    /// Override: produce TypeScript `.d.ts` (default from metadata; flag forces it on).
     #[arg(long)]
     dts: bool,
 
-    /// Output Flow declarations (`.js.flow`) via flowjs-rs.
+    /// Override: produce Flow `.js.flow` (default from metadata; flag forces it on).
     #[arg(long)]
     flow: bool,
 
-    /// Shorthand for --js --cjs --dts --flow.
+    /// Force all four outputs regardless of metadata config.
     #[arg(long)]
     all: bool,
 
@@ -63,7 +83,7 @@ struct BuildArgs {
     #[arg(long, default_value = ".")]
     path: PathBuf,
 
-    /// Output directory (default: `<crate>/pkg`).
+    /// Output directory (default: crate root).
     #[arg(long)]
     out_dir: Option<PathBuf>,
 }
@@ -72,33 +92,79 @@ struct BuildArgs {
 // Config (from Cargo.toml metadata)
 // ---------------------------------------------------------------------------
 
+fn default_true() -> bool { true }
+
+/// `[package.metadata.wasm-js-bridge]` configuration.
+///
+/// Output flags apply to every export in the package — you cannot mix formats
+/// per source file. ESM (`.js`) and TypeScript (`.d.ts`) are on by default.
+///
+/// ```toml
+/// [package.metadata.wasm-js-bridge]
+/// npm_name      = "@aql/predicates"
+/// wasm_features = "--features wasm"
+/// cjs    = true   # opt in to CJS shim
+/// jsflow = true   # opt in to Flow declarations
+/// # dts = true    # default; set false to suppress
+///
+/// [package.metadata.wasm-js-bridge.exports]
+/// "."      = "src/foo_bar.rs"   # stem derived: fooBar
+/// "./util" = "src/util.rs"      # stem derived: util
+/// ```
 #[derive(serde::Deserialize)]
 struct WjbMeta {
-    /// Source file that contains the `bundle!` invocation (e.g. `"src/lib.rs"`).
-    /// Used to derive the output stem. Default: `"src/lib.rs"`.
-    #[serde(default = "default_entry")]
-    entry: String,
-
     /// Cargo features to pass when building for WASM (e.g. `"--features wasm"`).
     #[serde(default = "default_wasm_features")]
     wasm_features: String,
+
+    /// npm package name (e.g. `"@aql/predicates"`). Required for package.json generation.
+    npm_name: Option<String>,
+
+    /// Produce a CJS `.cjs` shim. Default: `false`.
+    #[serde(default)]
+    cjs: bool,
+
+    /// Produce TypeScript `.d.ts` declarations. Default: `true`.
+    #[serde(default = "default_true")]
+    dts: bool,
+
+    /// Produce Flow `.js.flow` declarations. Default: `false`.
+    #[serde(default)]
+    jsflow: bool,
+
+    /// package.json subpath → source file path.
+    ///
+    /// The output stem is derived from the source filename:
+    /// `"src/foo_bar.rs"` → stem `"fooBar"`.
+    /// Default when absent: `{ ".": "src/lib.rs" }`.
+    #[serde(default)]
+    exports: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for WjbMeta {
     fn default() -> Self {
         Self {
-            entry: default_entry(),
             wasm_features: default_wasm_features(),
+            npm_name: None,
+            cjs: false,
+            dts: true,
+            jsflow: false,
+            exports: std::collections::BTreeMap::new(),
         }
     }
 }
 
-fn default_entry() -> String {
-    "src/lib.rs".to_string()
-}
-
 fn default_wasm_features() -> String {
     "--features wasm".to_string()
+}
+
+/// Return the exports map, defaulting to `{ ".": "src/lib.rs" }`.
+fn resolved_exports(meta: &WjbMeta) -> std::collections::BTreeMap<String, String> {
+    if meta.exports.is_empty() {
+        std::iter::once((".".to_string(), "src/lib.rs".to_string())).collect()
+    } else {
+        meta.exports.clone()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -188,6 +254,7 @@ fn cargo_build_wasm(
     crate_dir: &Path,
     pkg_name: &str,
     cargo_flags: &str,
+    peer_shim: Option<&Path>,
 ) -> Result<PathBuf, String> {
     let mut args = vec![
         "build".to_string(),
@@ -200,9 +267,13 @@ fn cargo_build_wasm(
         args.extend(cargo_flags.split_whitespace().map(String::from));
     }
 
-    let status = Command::new("cargo")
-        .args(&args)
-        .current_dir(crate_dir)
+    let mut cmd = Command::new("cargo");
+    cmd.args(&args).current_dir(crate_dir);
+    if let Some(shim) = peer_shim {
+        cmd.env("WJB_PEER_SHIM", shim);
+    }
+
+    let status = cmd
         .status()
         .map_err(|e| format!("Failed to run cargo build: {e}"))?;
 
@@ -246,54 +317,104 @@ fn cargo_build_wasm(
     }
 }
 
-/// Generate a self-contained CJS file with the WASM binary inlined as base64.
+/// Walk up from `crate_dir` to find the workspace `Cargo.lock`.
+fn find_cargo_lock(crate_dir: &Path) -> Option<PathBuf> {
+    let mut dir = crate_dir;
+    loop {
+        let candidate = dir.join("Cargo.lock");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        dir = dir.parent()?;
+    }
+}
+
+/// Read the `wasm-bindgen` version from `Cargo.lock`.
 ///
-/// Uses wasm-bindgen nodejs target in-memory, then patches the `readFileSync`
-/// WASM load with an inline `Buffer.from('BASE64', 'base64')` before writing.
-/// No `_bg.wasm` file is emitted.
-fn generate_cjs(wasm_path: &Path, out_dir: &Path, stem: &str) -> Result<(), String> {
-    std::fs::create_dir_all(out_dir)
-        .map_err(|e| format!("Failed to create {}: {e}", out_dir.display()))?;
+/// Returns `None` if the lockfile cannot be found or parsed, or if the crate
+/// is not present (e.g. the crate doesn't depend on wasm-bindgen).
+fn find_wasm_bindgen_version(crate_dir: &Path) -> Option<String> {
+    let lock_path = find_cargo_lock(crate_dir)?;
+    let content = std::fs::read_to_string(lock_path).ok()?;
+    let doc: toml::Value = content.parse().ok()?;
+    doc.get("package")?
+        .as_array()?
+        .iter()
+        .find(|p| p["name"].as_str() == Some("wasm-bindgen"))
+        .and_then(|p| p["version"].as_str())
+        .map(String::from)
+}
 
-    let mut output = Bindgen::new()
-        .input_path(wasm_path)
-        .nodejs(true)
-        .map_err(|e| format!("wasm-bindgen nodejs setup failed: {e}"))?
-        .out_name(stem)
-        .generate_output()
-        .map_err(|e| format!("wasm-bindgen CJS generation failed: {e}"))?;
+/// Validate that the `wasm-bindgen` CLI on PATH matches `expected_version`.
+///
+/// Emits a warning (not a hard error) if the version cannot be determined or
+/// does not match, since minor patch differences are sometimes compatible.
+fn check_wasm_bindgen_version(expected: &str, log: &logger::Logger) {
+    let output = match Command::new("wasm-bindgen").arg("--version").output() {
+        Ok(o) => o,
+        Err(e) => {
+            log.warn(&format!(
+                "Could not run wasm-bindgen: {e}. Install: cargo install wasm-bindgen-cli --version {expected}"
+            ));
+            return;
+        }
+    };
+    // Output format: "wasm-bindgen 0.2.108\n"
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let installed = stdout.trim().strip_prefix("wasm-bindgen ").unwrap_or("").trim();
+    if installed != expected {
+        log.warn(&format!(
+            "wasm-bindgen version mismatch: installed {installed}, Cargo.lock requires {expected}.\n  Fix: cargo install wasm-bindgen-cli --version {expected}"
+        ));
+    }
+}
 
-    let wasm_bytes = output.wasm_mut().emit_wasm();
-    let js = inline::inline_wasm_cjs(output.js(), &wasm_bytes)?;
+/// Invoke the `wasm-bindgen` CLI (from PATH) on `wasm_path` and return the
+/// raw nodejs JS string and WASM bytes.
+///
+/// Uses a temporary directory for the intermediate files, which is cleaned up
+/// before returning regardless of success or failure. The caller is responsible
+/// for further processing (inlining, ESM conversion, etc.).
+fn run_wasm_bindgen(wasm_path: &Path, stem: &str) -> Result<(String, Vec<u8>), String> {
+    let tmp = std::env::temp_dir().join(format!("wjb-{}-{stem}", std::process::id()));
+    std::fs::create_dir_all(&tmp)
+        .map_err(|e| format!("Failed to create temp dir: {e}"))?;
 
-    std::fs::write(out_dir.join(format!("{stem}.{EXT_CJS}")), js)
+    let result = (|| {
+        let status = Command::new("wasm-bindgen")
+            .args(["--target", "nodejs", "--out-name", stem, "--out-dir"])
+            .arg(&tmp)
+            .arg(wasm_path)
+            .status()
+            .map_err(|e| format!("Failed to run wasm-bindgen: {e}."))?;
+
+        if !status.success() {
+            return Err(format!("wasm-bindgen failed with {status}."));
+        }
+
+        let js = std::fs::read_to_string(tmp.join(format!("{stem}.js")))
+            .map_err(|e| format!("Failed to read wasm-bindgen JS output: {e}"))?;
+        let wasm_bytes = std::fs::read(tmp.join(format!("{stem}_bg.wasm")))
+            .map_err(|e| format!("Failed to read wasm-bindgen WASM output: {e}"))?;
+
+        Ok((js, wasm_bytes))
+    })();
+
+    let _ = std::fs::remove_dir_all(&tmp);
+    result
+}
+
+/// Write a self-contained CJS file with the WASM binary inlined as base64.
+fn write_cjs(js: &str, wasm_bytes: &[u8], out_dir: &Path, stem: &str) -> Result<(), String> {
+    let patched = inline::inline_wasm_cjs(js, wasm_bytes)?;
+    std::fs::write(out_dir.join(format!("{stem}.{EXT_CJS}")), patched)
         .map_err(|e| format!("Failed to write {stem}.{EXT_CJS}: {e}"))
 }
 
-/// Generate a self-contained ESM file with the WASM binary inlined as base64.
-///
-/// Uses wasm-bindgen nodejs target in-memory (synchronous init, easier to
-/// inline than the async bundler target), patches the WASM load with an inline
-/// `Uint8Array.from(atob('BASE64'), ...)`, then rewraps as ESM. No `_bg.wasm`
-/// file is emitted.
-fn generate_esm(wasm_path: &Path, out_dir: &Path, stem: &str) -> Result<(), String> {
-    std::fs::create_dir_all(out_dir)
-        .map_err(|e| format!("Failed to create {}: {e}", out_dir.display()))?;
-
-    let mut output = Bindgen::new()
-        .input_path(wasm_path)
-        .nodejs(true)
-        .map_err(|e| format!("wasm-bindgen nodejs setup failed: {e}"))?
-        .out_name(stem)
-        .generate_output()
-        .map_err(|e| format!("wasm-bindgen ESM generation failed: {e}"))?;
-
-    let wasm_bytes = output.wasm_mut().emit_wasm();
-    let js = inline::inline_wasm_esm(output.js(), &wasm_bytes)?;
-
-    // wasm-bindgen nodejs output uses require/module.exports; convert to ESM.
-    let esm = cjs_to_esm(&js, stem);
-
+/// Write a self-contained ESM file with the WASM binary inlined as base64.
+fn write_esm(js: &str, wasm_bytes: &[u8], out_dir: &Path, stem: &str) -> Result<(), String> {
+    let patched = inline::inline_wasm_esm(js, wasm_bytes)?;
+    let esm = cjs_to_esm(&patched, stem);
     std::fs::write(out_dir.join(format!("{stem}.{EXT_ESM}")), esm)
         .map_err(|e| format!("Failed to write {stem}.{EXT_ESM}: {e}"))
 }
@@ -455,83 +576,582 @@ fn run_cargo_test_codegen(crate_dir: &Path, pkg_name: &str, out_dir: &Path) -> R
         .map_err(|e| format!("Failed to run cargo test: {e}"))?;
 
     if !status.success() {
-        return Err(format!("cargo test codegen failed with {status}"));
+        return Err(format!("Codegen test failed with {status}"));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// package.json generation
+// ---------------------------------------------------------------------------
+
+/// A npm dep entry: name → version string (e.g. `"workspace:*"` or `"^0.1.0"`).
+type NpmDeps = std::collections::BTreeMap<String, String>;
+
+/// Run `cargo metadata` and return the raw JSON value.
+fn cargo_metadata(crate_dir: &Path) -> Result<serde_json::Value, String> {
+    let out = Command::new("cargo")
+        .args(["metadata", "--format-version", "1"])
+        .current_dir(crate_dir)
+        .output()
+        .map_err(|e| format!("Failed to run cargo metadata: {e}"))?;
+
+    if !out.status.success() {
+        return Err(format!(
+            "cargo metadata failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+
+    serde_json::from_slice(&out.stdout).map_err(|e| format!("Failed to parse cargo metadata: {e}"))
+}
+
+/// Walk the cargo metadata graph and return npm dependencies for `pkg_name`.
+///
+/// For each direct normal dependency of `pkg_name`:
+/// - If it has `[package.metadata.wasm-js-bridge].npm_name` → it produces an
+///   npm package. All deps use `"^{version}"`.
+/// - If it has no `npm_name` → pure Rust, already compiled into the WASM binary.
+///   No npm dep needed.
+fn resolve_npm_deps(metadata: &serde_json::Value, pkg_name: &str) -> Result<NpmDeps, String> {
+    let packages = metadata["packages"]
+        .as_array()
+        .ok_or("cargo metadata missing packages")?;
+
+
+    // Build id → package lookup
+    let by_id: std::collections::HashMap<&str, &serde_json::Value> = packages
+        .iter()
+        .filter_map(|p| p["id"].as_str().map(|id| (id, p)))
+        .collect();
+
+    // Find the current package
+    let current = packages
+        .iter()
+        .find(|p| p["name"].as_str() == Some(pkg_name))
+        .ok_or_else(|| format!("Package {pkg_name} not found in cargo metadata"))?;
+
+    let current_id = current["id"].as_str().ok_or("Package missing id")?;
+
+    // Find resolve node for current package
+    let node = metadata["resolve"]["nodes"]
+        .as_array()
+        .ok_or("cargo metadata missing resolve.nodes")?
+        .iter()
+        .find(|n| n["id"].as_str() == Some(current_id))
+        .ok_or_else(|| format!("No resolve node for {pkg_name}"))?;
+
+    let mut npm_deps = NpmDeps::new();
+
+    for dep in node["deps"].as_array().unwrap_or(&vec![]) {
+        // Skip dev and build deps
+        let is_normal = dep["dep_kinds"]
+            .as_array()
+            .map(|kinds| {
+                kinds
+                    .iter()
+                    .any(|k| k["kind"].is_null())
+            })
+            .unwrap_or(false);
+
+        if !is_normal {
+            continue;
+        }
+
+        let dep_id = dep["pkg"].as_str().unwrap_or_default();
+        let dep_pkg = match by_id.get(dep_id) {
+            Some(p) => *p,
+            None => continue,
+        };
+
+        // Check if this dep has an npm_name
+        let npm_name = dep_pkg["metadata"]["wasm-js-bridge"]["npm_name"].as_str();
+        if let Some(npm_name) = npm_name {
+            let version = format!(
+                "^{}",
+                dep_pkg["version"].as_str().unwrap_or("0.0.0")
+            );
+            npm_deps.insert(npm_name.to_string(), version);
+        }
+    }
+
+    Ok(npm_deps)
+}
+
+/// Generate `package.json` into `out_dir`.
+///
+/// The `exports` map is subpath → stem. If empty, defaults to `{ ".": stem }`.
+/// Each stem is expanded to the full condition object:
+/// ```json
+/// { "import": "./{stem}.js", "require": "./{stem}.cjs", "types": "./{stem}.d.ts" }
+/// ```
+///
+/// There is no standard package.json field for `.js.flow` declarations —
+/// Flow type resolution uses `flow-typed/` stubs or `[ignore]` config instead.
+/// The `.js.flow` file is emitted alongside the others for Flow users to consume
+/// directly, but is not referenced in package.json.
+fn generate_package_json(
+    pkg_name: &str,
+    stem: &str,
+    meta: &WjbMeta,
+    out_dir: &Path,
+    cargo_meta: &serde_json::Value,
+    log: &logger::Logger,
+) -> Result<(), String> {
+    let npm_name = match &meta.npm_name {
+        Some(n) => n.clone(),
+        None => {
+            log.warn("Skipping package.json — no npm_name in [package.metadata.wasm-js-bridge].");
+            return Ok(());
+        }
+    };
+
+    let version = cargo_meta["packages"]
+        .as_array()
+        .and_then(|pkgs| pkgs.iter().find(|p| p["name"].as_str() == Some(pkg_name)))
+        .and_then(|p| p["version"].as_str())
+        .unwrap_or("0.0.0")
+        .to_string();
+
+    let npm_deps = resolve_npm_deps(cargo_meta, pkg_name)?;
+
+    // Build the exports map: subpath → condition object.
+    // exports values are source file paths; derive stem from each.
+    let exports = resolved_exports(meta);
+
+    let mut exports_obj = serde_json::Map::new();
+    for (subpath, src_file) in &exports {
+        let export_stem = file_to_stem(src_file);
+        let mut conditions = serde_json::Map::new();
+        conditions.insert("import".to_string(), serde_json::json!(format!("./{export_stem}.{EXT_ESM}")));
+        if meta.cjs {
+            conditions.insert("require".to_string(), serde_json::json!(format!("./{export_stem}.{EXT_CJS}")));
+        }
+        if meta.dts {
+            conditions.insert("types".to_string(), serde_json::json!(format!("./{export_stem}.{EXT_DTS}")));
+        }
+        exports_obj.insert(subpath.clone(), serde_json::Value::Object(conditions));
+    }
+
+    // primary_stem is passed in by main (derived from "." export or first).
+    let primary_stem = stem;
+
+    let mut pkg = serde_json::Map::new();
+    pkg.insert("name".to_string(), serde_json::json!(npm_name));
+    pkg.insert("version".to_string(), serde_json::json!(version));
+    pkg.insert("type".to_string(), serde_json::json!("module"));
+    pkg.insert("main".to_string(), serde_json::json!(format!("./{primary_stem}.{EXT_CJS}")));
+    pkg.insert("module".to_string(), serde_json::json!(format!("./{primary_stem}.{EXT_ESM}")));
+    pkg.insert("types".to_string(), serde_json::json!(format!("./{primary_stem}.{EXT_DTS}")));
+    pkg.insert("exports".to_string(), serde_json::Value::Object(exports_obj));
+    pkg.insert("engines".to_string(), serde_json::json!({ "node": ">=18.0.0" }));
+
+    // Collect all generated filenames across all exports.
+    let mut files: Vec<serde_json::Value> = vec![serde_json::json!("package.json")];
+    for src_file in exports.values() {
+        let s = file_to_stem(src_file);
+        files.push(serde_json::json!(format!("{s}.{EXT_ESM}")));
+        if meta.cjs {
+            files.push(serde_json::json!(format!("{s}.{EXT_CJS}")));
+        }
+        if meta.dts {
+            files.push(serde_json::json!(format!("{s}.{EXT_DTS}")));
+        }
+        if meta.jsflow {
+            files.push(serde_json::json!(format!("{s}.{EXT_FLOW}")));
+        }
+    }
+    pkg.insert("files".to_string(), serde_json::Value::Array(files));
+
+    let mut scripts = serde_json::Map::new();
+    scripts.insert("prepack".to_string(), serde_json::json!("wasm-js-bridge build --all"));
+    pkg.insert("scripts".to_string(), serde_json::Value::Object(scripts));
+
+    let license = cargo_meta["packages"]
+        .as_array()
+        .and_then(|pkgs| pkgs.iter().find(|p| p["name"].as_str() == Some(pkg_name)))
+        .and_then(|p| p["license"].as_str())
+        .unwrap_or("MIT")
+        .to_string();
+    pkg.insert("license".to_string(), serde_json::json!(license));
+
+    let description = cargo_meta["packages"]
+        .as_array()
+        .and_then(|pkgs| pkgs.iter().find(|p| p["name"].as_str() == Some(pkg_name)))
+        .and_then(|p| p["description"].as_str())
+        .unwrap_or("")
+        .to_string();
+    if !description.is_empty() {
+        pkg.insert("description".to_string(), serde_json::json!(description));
+    }
+
+    let repository = cargo_meta["packages"]
+        .as_array()
+        .and_then(|pkgs| pkgs.iter().find(|p| p["name"].as_str() == Some(pkg_name)))
+        .and_then(|p| p["repository"].as_str())
+        .unwrap_or("")
+        .to_string();
+    if !repository.is_empty() {
+        pkg.insert("repository".to_string(), serde_json::json!(repository));
+    }
+
+    if !npm_deps.is_empty() {
+        pkg.insert("dependencies".to_string(), serde_json::to_value(&npm_deps).unwrap());
+    }
+
+    let json = serde_json::to_string_pretty(&serde_json::Value::Object(pkg))
+        .map_err(|e| format!("Failed to serialize package.json: {e}"))?;
+
+    std::fs::create_dir_all(out_dir)
+        .map_err(|e| format!("Failed to create {}: {e}", out_dir.display()))?;
+    std::fs::write(out_dir.join("package.json"), format!("{json}\n"))
+        .map_err(|e| format!("Failed to write package.json: {e}"))
 }
 
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
-fn main() {
-    let Cli::Build(args) = Cli::parse();
+/// Warn if any npm-packaged workspace dep appears in the crate's unconditional
+/// `[dependencies]` table.
+///
+/// Such deps will be statically linked into the WASM binary, making the peer
+/// import shim ineffective. They should be moved to
+/// `[target.'cfg(not(target_arch = "wasm32"))'.dependencies]`.
+fn check_peer_deps_not_unconditional(
+    crate_dir: &Path,
+    pkg_name: &str,
+    npm_pkgs: &std::collections::HashMap<&str, (&str, String, PathBuf, WjbMeta)>,
+    log: &logger::Logger,
+) {
+    let cargo_toml_path = crate_dir.join("Cargo.toml");
+    let raw = match std::fs::read_to_string(&cargo_toml_path) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let doc: toml::Value = match raw.parse() {
+        Ok(v) => v,
+        Err(_) => return,
+    };
 
-    let want_js = args.js || args.all;
-    let want_cjs = args.cjs || args.all;
-    let want_dts = args.dts || args.all;
-    let want_flow = args.flow || args.all;
+    let unconditional_deps = match doc.get("dependencies").and_then(|v| v.as_table()) {
+        Some(t) => t.keys().cloned().collect::<Vec<_>>(),
+        None => return,
+    };
 
-    if !want_js && !want_cjs && !want_dts && !want_flow {
-        eprintln!("Nothing to build. Use --all or specify outputs: --js --cjs --dts --flow");
+    // Build set of cargo package names that have npm_name (i.e. are npm-packaged).
+    let npm_pkg_names: std::collections::HashSet<&str> = npm_pkgs
+        .values()
+        .map(|(name, _, _, _)| *name)
+        .collect();
+
+    for dep_name in &unconditional_deps {
+        // Cargo dep names use hyphens; match against pkg names directly.
+        let normalized = dep_name.replace('_', "-");
+        if npm_pkg_names.contains(normalized.as_str()) || npm_pkg_names.contains(dep_name.as_str()) {
+            log.warn(&format!(
+                "\"{}\" is a regular [dependencies] entry in {} — it will be statically linked \
+                into the WASM binary, making the peer import shim ineffective. Move it to \
+                [target.'cfg(not(target_arch = \"wasm32\"))'.dependencies].",
+                dep_name, pkg_name
+            ));
+        }
+    }
+}
+
+/// Build all npm-packaged workspace crates in topological order, passing
+/// parsed WASM exports from each package to its dependents as peer import shims.
+///
+/// This is the webpack equivalent: outputs from earlier builds feed directly
+/// into the import generation for later builds — no intermediate files committed.
+fn build_workspace(args: BuildWorkspaceArgs, log: &logger::Logger) {
+    let die = |msg: &str| -> ! {
+        log.error(msg);
         std::process::exit(1);
+    };
+
+    // Discover workspace root and all members.
+    let workspace_dir = std::env::current_dir()
+        .unwrap_or_else(|e| die(&format!("Failed to get current directory: {e}")));
+
+    let cargo_meta = cargo_metadata(&workspace_dir)
+        .unwrap_or_else(|e| die(&e));
+
+    // Collect all workspace packages that have npm_name.
+    let packages = cargo_meta["packages"]
+        .as_array()
+        .unwrap_or_else(|| die("cargo metadata missing packages"));
+
+    let workspace_members: std::collections::HashSet<&str> = cargo_meta["workspace_members"]
+        .as_array()
+        .unwrap_or_else(|| die("cargo metadata missing workspace_members"))
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+
+    // pkg_id → (pkg_name, npm_name, manifest_path, meta)
+    let mut npm_pkgs: std::collections::HashMap<&str, (&str, String, PathBuf, WjbMeta)> =
+        std::collections::HashMap::new();
+
+    for pkg in packages {
+        let id = pkg["id"].as_str().unwrap_or_default();
+        if !workspace_members.contains(id) { continue; }
+
+        let npm_name = match pkg["metadata"]["wasm-js-bridge"]["npm_name"].as_str() {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+
+        let pkg_name = pkg["name"].as_str().unwrap_or_default();
+        let manifest = PathBuf::from(pkg["manifest_path"].as_str().unwrap_or_default());
+        let crate_dir = manifest.parent().unwrap_or(&manifest).to_path_buf();
+
+        let meta = read_meta(&crate_dir)
+            .unwrap_or_else(|e| die(&e))
+            .1;
+
+        npm_pkgs.insert(id, (pkg_name, npm_name, crate_dir, meta));
     }
 
+    // Topological sort: build deps before dependents.
+    // Walk resolve graph, emit packages with no unbuilt npm deps first.
+    let nodes = cargo_meta["resolve"]["nodes"]
+        .as_array()
+        .unwrap_or_else(|| die("cargo metadata missing resolve.nodes"));
+
+    let mut built: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut order: Vec<&str> = Vec::new();
+
+    // Simple iterative topo sort (small graph, no cycle detection needed).
+    while order.len() < npm_pkgs.len() {
+        let before = order.len();
+        'outer: for &id in npm_pkgs.keys() {
+            if built.contains(id) { continue; }
+            // Check all npm-packaged deps are already built.
+            for node in nodes {
+                if node["id"].as_str() != Some(id) { continue; }
+                for dep in node["deps"].as_array().unwrap_or(&vec![]) {
+                    let dep_id = dep["pkg"].as_str().unwrap_or_default();
+                    if npm_pkgs.contains_key(dep_id) && !built.contains(dep_id) {
+                        continue 'outer;
+                    }
+                }
+            }
+            order.push(id);
+            built.insert(id);
+        }
+        if order.len() == before {
+            die("Dependency cycle detected among npm-packaged workspace crates.");
+        }
+    }
+
+    // exported_js[pkg_id] = (wasm-bindgen CJS JS output, WASM bytes) for peer shim generation.
+    let mut exported_js: std::collections::HashMap<&str, (String, Vec<u8>)> = std::collections::HashMap::new();
+
+    for &id in &order {
+        let (pkg_name, npm_name, crate_dir, meta) = &npm_pkgs[id];
+        let (pkg_name, npm_name, crate_dir) = (*pkg_name, npm_name.as_str(), crate_dir.as_path());
+        let pkg_log = log.child(Box::leak(pkg_name.to_string().into_boxed_str()));
+
+        let out_dir = args.out_dir
+            .as_deref()
+            .map(|d| d.join(pkg_name))
+            .unwrap_or_else(|| crate_dir.to_path_buf());
+
+        // Generate peer shim from all npm-packaged deps that have been built.
+        let mut shim_content = String::new();
+        for node in nodes {
+            if node["id"].as_str() != Some(id) { continue; }
+            for dep in node["deps"].as_array().unwrap_or(&vec![]) {
+                let dep_id = dep["pkg"].as_str().unwrap_or_default();
+                if let Some((js, wasm_bytes)) = exported_js.get(dep_id) {
+                    let (_, dep_npm_name, _, _) = &npm_pkgs[dep_id];
+                    let exports = peer::merge_wasm_exports(peer::parse_exports(js), wasm_bytes);
+                    shim_content.push_str(&peer::generate_peer_shim(&exports, dep_npm_name));
+                }
+            }
+        }
+
+        // Write shim to tempfile; cargo build reads it via WJB_PEER_SHIM.
+        let shim_path = if shim_content.is_empty() {
+            None
+        } else {
+            let path = std::env::temp_dir()
+                .join(format!("wjb-peers-{}-{}.rs", std::process::id(), pkg_name));
+            std::fs::write(&path, &shim_content)
+                .unwrap_or_else(|e| die(&format!("Failed to write peer shim: {e}")));
+            Some(path)
+        };
+
+        // Warn if any npm-packaged dep appears in unconditional [dependencies].
+        // Such deps will be statically linked into the WASM binary, making the
+        // peer import shim ineffective.
+        check_peer_deps_not_unconditional(crate_dir, pkg_name, &npm_pkgs, &pkg_log);
+
+        pkg_log.step("Compiling to WASM…");
+        let wasm_path = cargo_build_wasm(crate_dir, pkg_name, &meta.wasm_features, shim_path.as_deref())
+            .unwrap_or_else(|e| die(&e));
+
+        // Cleanup shim tempfile immediately after build.
+        if let Some(p) = &shim_path {
+            let _ = std::fs::remove_file(p);
+        }
+
+        std::fs::create_dir_all(&out_dir)
+            .unwrap_or_else(|e| die(&format!("Failed to create {}: {e}", out_dir.display())));
+
+        let exports = resolved_exports(meta);
+        let primary_stem = exports.get(".").map(|s| file_to_stem(s))
+            .unwrap_or_else(|| file_to_stem(exports.values().next().unwrap_or(&"src/lib.rs".to_string())));
+
+        pkg_log.step("Running wasm-bindgen…");
+        let (js, wasm_bytes) = run_wasm_bindgen(&wasm_path, &primary_stem)
+            .unwrap_or_else(|e| die(&e));
+
+        // Stash JS and WASM bytes for peer shim generation of downstream packages.
+        exported_js.insert(id, (js.clone(), wasm_bytes.clone()));
+
+        if meta.cjs {
+            pkg_log.step(&format!("Generating ESM + CJS ({primary_stem}.{EXT_ESM}, {primary_stem}.{EXT_CJS})…"));
+            std::thread::scope(|s| {
+                let esm = s.spawn(|| write_esm(&js, &wasm_bytes, &out_dir, &primary_stem));
+                let cjs = s.spawn(|| write_cjs(&js, &wasm_bytes, &out_dir, &primary_stem));
+                esm.join().unwrap_or_else(|_| Err("ESM thread panicked".into()))
+                    .unwrap_or_else(|e| die(&e));
+                cjs.join().unwrap_or_else(|_| Err("CJS thread panicked".into()))
+                    .unwrap_or_else(|e| die(&e));
+            });
+        } else {
+            pkg_log.step(&format!("Generating ESM ({primary_stem}.{EXT_ESM})…"));
+            write_esm(&js, &wasm_bytes, &out_dir, &primary_stem).unwrap_or_else(|e| die(&e));
+        }
+
+        if meta.dts || meta.jsflow {
+            pkg_log.step("Generating type declarations…");
+            run_cargo_test_codegen(crate_dir, pkg_name, &out_dir)
+                .unwrap_or_else(|e| die(&e));
+        }
+
+        let cargo_meta_val = cargo_metadata(crate_dir).unwrap_or_else(|e| die(&e));
+        pkg_log.step("Generating package.json…");
+        generate_package_json(pkg_name, &primary_stem, meta, &out_dir, &cargo_meta_val, &pkg_log)
+            .unwrap_or_else(|e| die(&e));
+
+        pkg_log.done(&format!("{npm_name} complete."));
+    }
+}
+
+fn main() {
+    logger::init();
+    let log = logger::Logger::new("wasm-js-bridge");
+
+    let cli = Cli::parse();
+
+    if let Cli::BuildWorkspace(args) = cli {
+        build_workspace(args, &log);
+        return;
+    }
+
+    let Cli::Build(args) = cli else { unreachable!() };
+
     let crate_dir = std::fs::canonicalize(&args.path).unwrap_or_else(|e| {
-        eprintln!("Invalid path {}: {e}", args.path.display());
+        log.error(&format!("Invalid path {}: {e}.", args.path.display()));
         std::process::exit(1);
     });
 
     let (pkg_name, meta) = read_meta(&crate_dir).unwrap_or_else(|e| {
-        eprintln!("{e}");
+        log.error(&e);
         std::process::exit(1);
     });
 
-    let stem = file_to_stem(&meta.entry);
-    let out_dir = args
-        .out_dir
-        .unwrap_or_else(|| crate_dir.join("pkg"));
+    let out_dir = args.out_dir.unwrap_or_else(|| crate_dir.clone());
+    let exports = resolved_exports(&meta);
 
-    eprintln!("wasm-js-bridge: {pkg_name} → stem \"{stem}\"");
+    // CLI flags layer on top of metadata. ESM (.js) is always produced.
+    let want_cjs   = args.all || args.cjs  || meta.cjs;
+    let want_dts   = args.all || args.dts  || meta.dts;
+    let want_jsflow = args.all || args.flow || meta.jsflow;
 
-    let step = |outputs: &str| eprintln!("  → {outputs}");
-    let run = |result: Result<(), String>| {
-        result.unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(1);
-        })
-    };
-    let run_t = |result: Result<PathBuf, String>| {
-        result.unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(1);
-        })
+    let log = log.child(Box::leak(pkg_name.clone().into_boxed_str()));
+    log.step(&format!("Building {} export(s)…", exports.len()));
+
+    let die = |msg: &str| -> ! {
+        log.error(msg);
+        std::process::exit(1);
     };
 
-    // Step 1: Compile to WASM (needed for --js or --cjs)
-    let wasm_path = if want_js || want_cjs {
-        step("cargo build --target wasm32-unknown-unknown");
-        Some(run_t(cargo_build_wasm(&crate_dir, &pkg_name, &meta.wasm_features)))
-    } else {
-        None
+    // Prefetch cargo metadata on a background thread — it's read-only and fast,
+    // so it can overlap with the (potentially slow) WASM compile below.
+    let meta_crate_dir = crate_dir.clone();
+    let cargo_meta_thread = std::thread::spawn(move || cargo_metadata(&meta_crate_dir));
+
+    // Validate wasm-bindgen CLI version against Cargo.lock before compiling.
+    if let Some(required) = find_wasm_bindgen_version(&crate_dir) {
+        check_wasm_bindgen_version(&required, &log);
+    }
+
+    // Compile to WASM once for the whole crate. This is the slow step.
+    log.step("Compiling to WASM…");
+    let wasm_path = match cargo_build_wasm(&crate_dir, &pkg_name, &meta.wasm_features, None) {
+        Ok(p) => p,
+        Err(e) => die(&e),
     };
 
-    if want_js {
-        step(&format!("{stem}.{EXT_ESM}"));
-        run(generate_esm(wasm_path.as_ref().unwrap(), &out_dir, &stem));
+    std::fs::create_dir_all(&out_dir)
+        .unwrap_or_else(|e| die(&format!("Failed to create {}: {e}", out_dir.display())));
+
+    // For each export: run wasm-bindgen (one invocation per stem), then write
+    // ESM + optionally CJS in parallel. All exports share the same .wasm binary.
+    for (subpath, src_file) in &exports {
+        let stem = file_to_stem(src_file);
+        let export_log = log.child(Box::leak(format!("{subpath} → {stem}").into_boxed_str()));
+
+        export_log.step("Running wasm-bindgen…");
+        let (js, wasm_bytes) = match run_wasm_bindgen(&wasm_path, &stem) {
+            Ok(pair) => pair,
+            Err(e) => die(&e),
+        };
+
+        if want_cjs {
+            export_log.step(&format!("Generating ESM + CJS ({stem}.{EXT_ESM}, {stem}.{EXT_CJS})…"));
+            std::thread::scope(|s| {
+                let esm = s.spawn(|| write_esm(&js, &wasm_bytes, &out_dir, &stem));
+                let cjs = s.spawn(|| write_cjs(&js, &wasm_bytes, &out_dir, &stem));
+                if let Err(e) = esm.join().unwrap_or_else(|_| Err("ESM thread panicked".into())) {
+                    die(&e);
+                }
+                if let Err(e) = cjs.join().unwrap_or_else(|_| Err("CJS thread panicked".into())) {
+                    die(&e);
+                }
+            });
+        } else {
+            export_log.step(&format!("Generating ESM ({stem}.{EXT_ESM})…"));
+            if let Err(e) = write_esm(&js, &wasm_bytes, &out_dir, &stem) { die(&e); }
+        }
     }
 
-    if want_cjs {
-        step(&format!("{stem}.{EXT_CJS}"));
-        run(generate_cjs(wasm_path.as_ref().unwrap(), &out_dir, &stem));
+    if want_dts || want_jsflow {
+        log.step("Generating type declarations…");
+        if let Err(e) = run_cargo_test_codegen(&crate_dir, &pkg_name, &out_dir) {
+            die(&e);
+        }
     }
 
-    if want_dts || want_flow {
-        step(&format!("{stem}.{EXT_DTS} + {stem}.{EXT_FLOW}"));
-        run(run_cargo_test_codegen(&crate_dir, &pkg_name, &out_dir));
+    // Collect prefetched metadata (likely already done by now).
+    let cargo_meta = cargo_meta_thread
+        .join()
+        .unwrap_or_else(|_| Err("cargo metadata thread panicked".into()))
+        .unwrap_or_else(|e| die(&e));
+
+    log.step("Generating package.json…");
+    // Primary stem is derived from the "." export, or the first export if absent.
+    let primary_stem = exports.get(".").map(|s| file_to_stem(s))
+        .unwrap_or_else(|| file_to_stem(exports.values().next().unwrap()));
+    if let Err(e) = generate_package_json(&pkg_name, &primary_stem, &meta, &out_dir, &cargo_meta, &log) {
+        die(&e);
     }
 
-    eprintln!("wasm-js-bridge: done");
+    log.done("Build complete.");
 }
 
 #[cfg(test)]
