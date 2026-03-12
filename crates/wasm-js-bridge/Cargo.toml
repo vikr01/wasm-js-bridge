@@ -7,7 +7,7 @@ description = "Build tool for packaging Rust crates as npm WASM packages with Ty
 repository.workspace = true
 
 [dependencies]
-wasm-js-bridge-macros = { version = "0.1.1", path = "../wasm-js-bridge-macros" }
+wasm-js-bridge-macros = { version = "0.0.0-alpha.0", path = "../wasm-js-bridge-macros" }
 
 [dependencies.ts-rs]
 version = "12"
@@ -15,7 +15,7 @@ features = ["serde-json-impl", "no-serde-warnings"]
 optional = true
 
 [dependencies.flowjs-rs]
-version = "0.3.1"
+version = "0.0.0-alpha.0"
 path = "../../../flowjs-rs/crates/flowjs-rs"
 features = ["serde-json-impl"]
 optional = true

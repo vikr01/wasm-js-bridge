@@ -708,7 +708,7 @@ dependencies = [
 
 [[package]]
 name = "wasm-js-bridge"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "flowjs-rs",
  "ts-rs",
@@ -717,7 +717,7 @@ dependencies = [
 
 [[package]]
 name = "wasm-js-bridge-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "clap",
@@ -732,7 +732,7 @@ dependencies = [
 
 [[package]]
 name = "wasm-js-bridge-macros"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "proc-macro2",
  "quote",
