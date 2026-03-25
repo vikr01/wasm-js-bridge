@@ -1,10 +1,16 @@
 [workspace]
 members = [
+  "crates/js-bridge-core",
   "crates/wasm-js-bridge",
   "crates/wasm-js-bridge-macros",
   "crates/wasm-js-bridge-cli",
+  "crates/typescript-checker",
+  "crates/wasm-js-bridge-validate",
 ]
 resolver = "2"
+
+[patch.crates-io]
+flowjs-parser = { path = "../flowjs-rs/crates/flow-parser" }
 
 [workspace.package]
 version = "0.0.0-alpha.0"

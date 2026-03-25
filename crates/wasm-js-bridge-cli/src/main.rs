@@ -34,6 +34,9 @@ const EXT_DTS: &str = "d.ts";
 const EXT_FLOW: &str = "js.flow";
 
 use clap::Parser;
+use js_bridge_core::cargo::{cargo_metadata, find_cargo_lock, read_feature_names};
+use js_bridge_core::naming::{file_to_stem, is_valid_js_identifier};
+use js_bridge_core::npm::{is_normal_dep, resolve_npm_deps};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -152,6 +155,12 @@ struct WjbMeta {
     /// (e.g. packages in the same workspace whose Cargo dep is optional).
     #[serde(default)]
     peers: Vec<String>,
+
+    /// Emit a `prepublishOnly` script that runs
+    /// `cargo test -p <crate> --features validate -- validate_npm_package --nocapture`.
+    /// The crate must expose a `validate` feature and a `validate_npm_package` test.
+    #[serde(default)]
+    prepublish_validate: bool,
 }
 
 impl Default for WjbMeta {
@@ -164,6 +173,7 @@ impl Default for WjbMeta {
             jsflow: false,
             exports: std::collections::BTreeMap::new(),
             peers: Vec::new(),
+            prepublish_validate: false,
         }
     }
 }
@@ -179,53 +189,6 @@ fn resolved_exports(meta: &WjbMeta) -> std::collections::BTreeMap<String, String
     } else {
         meta.exports.clone()
     }
-}
-
-// ---------------------------------------------------------------------------
-// Naming
-// ---------------------------------------------------------------------------
-
-fn snake_to_camel(s: &str) -> String {
-    let mut result = String::new();
-    let mut capitalize_next = false;
-    for c in s.chars() {
-        if c == '_' {
-            capitalize_next = true;
-        } else if capitalize_next {
-            result.push(c.to_ascii_uppercase());
-            capitalize_next = false;
-        } else {
-            result.push(c);
-        }
-    }
-    result
-}
-
-/// Derive the camelCase output stem from a source file path.
-///
-/// `"src/foo_bar.rs"` → `"fooBar"`, `"src/lib.rs"` → `"lib"`.
-/// For `mod.rs`, the parent directory name is used.
-fn file_to_stem(file: &str) -> String {
-    let path = Path::new(file);
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown");
-    let base = if stem == "mod" {
-        let parent = path
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|s| s.to_str())
-            .unwrap_or("mod");
-        if parent == "src" {
-            "mod"
-        } else {
-            parent
-        }
-    } else {
-        stem
-    };
-    snake_to_camel(base)
 }
 
 // ---------------------------------------------------------------------------
@@ -329,18 +292,6 @@ fn cargo_build_wasm(
             local.display(),
             workspace.display(),
         ))
-    }
-}
-
-/// Walk up from `crate_dir` to find the workspace `Cargo.lock`.
-fn find_cargo_lock(crate_dir: &Path) -> Option<PathBuf> {
-    let mut dir = crate_dir;
-    loop {
-        let candidate = dir.join("Cargo.lock");
-        if candidate.exists() {
-            return Some(candidate);
-        }
-        dir = dir.parent()?;
     }
 }
 
@@ -600,30 +551,6 @@ fn is_identity_export(name: &str, value: &str) -> bool {
     false
 }
 
-fn is_valid_js_identifier(s: &str) -> bool {
-    let mut chars = s.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    let valid_start = first == '_' || first == '$' || first.is_ascii_alphabetic();
-    valid_start && chars.all(|c| c == '_' || c == '$' || c.is_ascii_alphanumeric())
-}
-
-fn read_feature_names(crate_dir: &Path) -> Result<std::collections::HashSet<String>, String> {
-    let cargo_toml_path = crate_dir.join("Cargo.toml");
-    let raw = std::fs::read_to_string(&cargo_toml_path)
-        .map_err(|e| format!("Failed to read {}: {e}", cargo_toml_path.display()))?;
-    let doc: toml::Value = raw
-        .parse()
-        .map_err(|e| format!("Failed to parse {}: {e}", cargo_toml_path.display()))?;
-
-    Ok(doc
-        .get("features")
-        .and_then(|v| v.as_table())
-        .map(|t| t.keys().cloned().collect())
-        .unwrap_or_default())
-}
-
 fn run_cargo_test_codegen(
     crate_dir: &Path,
     pkg_name: &str,
@@ -690,94 +617,6 @@ fn codegen_features_for_request(
 // package.json generation
 // ---------------------------------------------------------------------------
 
-/// A npm dep entry: name → version string (e.g. `"workspace:*"` or `"^0.1.0"`).
-type NpmDeps = std::collections::BTreeMap<String, String>;
-
-/// Run `cargo metadata` and return the raw JSON value.
-fn cargo_metadata(crate_dir: &Path) -> Result<serde_json::Value, String> {
-    let out = Command::new("cargo")
-        .args(["metadata", "--format-version", "1"])
-        .current_dir(crate_dir)
-        .output()
-        .map_err(|e| format!("Failed to run cargo metadata: {e}"))?;
-
-    if !out.status.success() {
-        return Err(format!(
-            "cargo metadata failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
-
-    serde_json::from_slice(&out.stdout).map_err(|e| format!("Failed to parse cargo metadata: {e}"))
-}
-
-fn is_normal_dep(dep: &serde_json::Value) -> bool {
-    dep["dep_kinds"]
-        .as_array()
-        .map(|kinds| kinds.iter().any(|k| k["kind"].is_null()))
-        .unwrap_or(false)
-}
-
-/// Walk the cargo metadata graph and return npm dependencies for `pkg_name`.
-///
-/// For each direct normal dependency of `pkg_name`:
-/// - If it has `[package.metadata.wasm-js-bridge].npm_name` → it produces an
-///   npm package. All deps use `"^{version}"`.
-/// - If it has no `npm_name` → pure Rust, already compiled into the WASM binary.
-///   No npm dep needed.
-fn resolve_npm_deps(metadata: &serde_json::Value, pkg_name: &str) -> Result<NpmDeps, String> {
-    let packages = metadata["packages"]
-        .as_array()
-        .ok_or("cargo metadata missing packages")?;
-
-    // Build id → package lookup
-    let by_id: std::collections::HashMap<&str, &serde_json::Value> = packages
-        .iter()
-        .filter_map(|p| p["id"].as_str().map(|id| (id, p)))
-        .collect();
-
-    // Find the current package
-    let current = packages
-        .iter()
-        .find(|p| p["name"].as_str() == Some(pkg_name))
-        .ok_or_else(|| format!("Package {pkg_name} not found in cargo metadata"))?;
-
-    let current_id = current["id"].as_str().ok_or("Package missing id")?;
-
-    // Find resolve node for current package
-    let node = metadata["resolve"]["nodes"]
-        .as_array()
-        .ok_or("cargo metadata missing resolve.nodes")?
-        .iter()
-        .find(|n| n["id"].as_str() == Some(current_id))
-        .ok_or_else(|| format!("No resolve node for {pkg_name}"))?;
-
-    let mut npm_deps = NpmDeps::new();
-
-    if let Some(deps) = node["deps"].as_array() {
-        for dep in deps {
-            if !is_normal_dep(dep) {
-                continue;
-            }
-
-            let dep_id = dep["pkg"].as_str().unwrap_or_default();
-            let dep_pkg = match by_id.get(dep_id) {
-                Some(p) => *p,
-                None => continue,
-            };
-
-            // Check if this dep has an npm_name
-            let npm_name = dep_pkg["metadata"]["wasm-js-bridge"]["npm_name"].as_str();
-            if let Some(npm_name) = npm_name {
-                let version = format!("^{}", dep_pkg["version"].as_str().unwrap_or("0.0.0"));
-                npm_deps.insert(npm_name.to_string(), version);
-            }
-        }
-    }
-
-    Ok(npm_deps)
-}
-
 /// Generate `package.json` into `out_dir`.
 ///
 /// The `exports` map is subpath → stem. If empty, defaults to `{ ".": stem }`.
@@ -813,7 +652,7 @@ fn generate_package_json(
         .unwrap_or("0.0.0")
         .to_string();
 
-    let npm_deps = resolve_npm_deps(cargo_meta, pkg_name)?;
+    let npm_deps = resolve_npm_deps(cargo_meta, pkg_name, "wasm-js-bridge")?;
 
     // Build the exports map: subpath → stem.
     let exports = resolved_exports(meta);
@@ -917,6 +756,14 @@ fn generate_package_json(
         "prepack".to_string(),
         serde_json::json!("wasm-js-bridge build-workspace"),
     );
+    if meta.prepublish_validate {
+        scripts.insert(
+            "prepublishOnly".to_string(),
+            serde_json::json!(format!(
+                "cargo test -p {pkg_name} --features validate -- validate_npm_package --nocapture"
+            )),
+        );
+    }
     pkg.insert("scripts".to_string(), serde_json::Value::Object(scripts));
 
     let license = cargo_meta["packages"]
@@ -1642,6 +1489,8 @@ wasm = instance;
             jsflow: true,
             exports: BTreeMap::new(),
             wasm_features: "--features wasm".to_string(),
+            peers: Vec::new(),
+            prepublish_validate: false,
         };
         let log = logger::Logger::new("test");
 
@@ -1751,6 +1600,8 @@ wasm = instance;
             jsflow: false,
             exports,
             wasm_features: "--features wasm".to_string(),
+            peers: Vec::new(),
+            prepublish_validate: false,
         };
         let log = logger::Logger::new("test");
 
