@@ -1,0 +1,11 @@
+[package]
+name = "wasm-js-bridge-validate"
+version = "0.0.0-alpha.0"
+edition = "2021"
+description = "Shared publish-time validation for wasm-js-bridge npm artifacts"
+license = "MIT"
+repository = "https://github.com/vikr01/wasm-js-bridge"
+
+[dependencies]
+flowjs-parser = "0.0.0-alpha.0"
+typescript-checker = "0.1.0"

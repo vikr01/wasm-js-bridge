@@ -302,7 +302,7 @@ checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 
 [[package]]
 name = "js-bridge-core"
-version = "0.0.0-alpha.0"
+version = "0.0.0-alpha.1"
 dependencies = [
  "colored",
  "serde",
@@ -849,7 +849,7 @@ dependencies = [
 
 [[package]]
 name = "wasm-js-bridge"
-version = "0.0.0-alpha.0"
+version = "0.0.0-alpha.1"
 dependencies = [
  "flowjs-rs",
  "ts-rs",
@@ -858,7 +858,7 @@ dependencies = [
 
 [[package]]
 name = "wasm-js-bridge-cli"
-version = "0.0.0-alpha.0"
+version = "0.0.0-alpha.1"
 dependencies = [
  "base64",
  "clap",
@@ -874,7 +874,7 @@ dependencies = [
 
 [[package]]
 name = "wasm-js-bridge-macros"
-version = "0.0.0-alpha.0"
+version = "0.0.0-alpha.1"
 dependencies = [
  "proc-macro2",
  "quote",

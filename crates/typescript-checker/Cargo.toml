@@ -1,0 +1,16 @@
+[package]
+name = "typescript-checker"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78.0"
+description = "Type-checks TypeScript declaration files via the TypeScript compiler API embedded in QuickJS"
+license = "MIT"
+repository = "https://github.com/vikr01/wasm-js-bridge"
+keywords = ["typescript", "typecheck", "quickjs", "declarations"]
+categories = ["development-tools"]
+exclude = ["bun.lock", "node_modules/"]
+
+[dependencies]
+quick-js = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
