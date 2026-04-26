@@ -193,13 +193,15 @@ fn wasm_return_body(ret_ty: &Type, call: TokenStream2) -> TokenStream2 {
         };
         quote!(
             let __result = #call.map_err(#err_conv)?;
-            ::serde_wasm_bindgen::to_value(&__result)
+            let __serializer = ::serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+            ::serde::Serialize::serialize(&__result, &__serializer)
                 .map_err(|e| ::wasm_bindgen::JsError::new(&e.to_string()))
         )
     } else {
         quote!(
             let __result = #call;
-            ::serde_wasm_bindgen::to_value(&__result)
+            let __serializer = ::serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+            ::serde::Serialize::serialize(&__result, &__serializer)
                 .map_err(|e| ::wasm_bindgen::JsError::new(&e.to_string()))
         )
     }
